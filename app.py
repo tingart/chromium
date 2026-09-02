@@ -174,13 +174,14 @@ async def navigate(payload: NavigatePayload):
         return {"status": "error", "message": str(e)}
 
 @app.post("/touch")
+@app.post("/touch")
 async def handle_touch(payload: TouchPayload):
-    global pages, active_tab_index, context
+    global pages, active_tab_index
     if not pages:
         return {"status": "error"}
     
     current_page = pages[active_tab_index]
-    viewport = context.viewport_size
+    viewport = current_page.viewport_size  # <-- FIXED
     
     # Scale based on client screen size
     scale_x = viewport["width"] / payload.screen_width
