@@ -24,6 +24,10 @@ context = None
 pages: List = []
 active_tab_index: int = 0
 
+# Default viewport (will be overridden by client size if provided)
+DEFAULT_WIDTH = 854
+DEFAULT_HEIGHT = 480
+
 @app.on_event("startup")
 async def startup_event():
     global playwright_instance, browser, context, pages, active_tab_index
@@ -41,19 +45,21 @@ async def startup_event():
         ]
     )
     
-    # Render 0.1 vCPU Optimized Viewport (854x480)
     context = await browser.new_context(
-        viewport={"width": 854, "height": 480},
+        viewport={"width": DEFAULT_WIDTH, "height": DEFAULT_HEIGHT},
         device_scale_factor=1,
-        is_mobile=False,
-        has_touch=False,
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        is_mobile=True,   # mobile mode enabled
+        has_touch=True,   # touch events enabled
+        user_agent="Mozilla/5.0 (Linux; Android 12; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
     )
     
     await context.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined
         });
+        const style = document.createElement('style');
+        style.innerHTML = '* { animation: none !important; transition: none !important; }';
+        document.head.appendChild(style);
     """)
     
     initial_page = await context.new_page()
@@ -83,14 +89,12 @@ async def frame_generator():
         if pages and active_tab_index < len(pages):
             try:
                 current_page = pages[active_tab_index]
-                # Lower quality & resolution = 10x faster encoding on 0.1 vCPU
-                screenshot = await current_page.screenshot(type="jpeg", quality=35)
+                screenshot = await current_page.screenshot(type="jpeg", quality=25)  # lower quality
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + screenshot + b'\r\n')
             except Exception:
                 pass
-        # 0.20s = ~5 FPS (Ideal for 0.1 vCPU stability)
-        await asyncio.sleep(0.20)
+        await asyncio.sleep(0.35)  # ~3 FPS for stability
 
 @app.get("/screen")
 async def stream_screen():
@@ -103,6 +107,8 @@ class TouchPayload(BaseModel):
     x: int
     y: int
     action: Optional[str] = "click"
+    screen_width: Optional[int] = DEFAULT_WIDTH
+    screen_height: Optional[int] = DEFAULT_HEIGHT
 
 class KeyPayload(BaseModel):
     key: str
@@ -169,17 +175,26 @@ async def navigate(payload: NavigatePayload):
 
 @app.post("/touch")
 async def handle_touch(payload: TouchPayload):
-    global pages, active_tab_index
+    global pages, active_tab_index, context
     if not pages:
         return {"status": "error"}
     
     current_page = pages[active_tab_index]
-    await current_page.mouse.move(payload.x, payload.y)
+    viewport = context.viewport_size
+    
+    # Scale based on client screen size
+    scale_x = viewport["width"] / payload.screen_width
+    scale_y = viewport["height"] / payload.screen_height
+    
+    real_x = int(payload.x * scale_x)
+    real_y = int(payload.y * scale_y)
+    
+    await current_page.mouse.move(real_x, real_y)
     
     if payload.action == "click":
-        await current_page.mouse.click(payload.x, payload.y, delay=50)
+        await current_page.mouse.click(real_x, real_y, delay=50)
     elif payload.action == "right_click":
-        await current_page.mouse.click(payload.x, payload.y, button="right")
+        await current_page.mouse.click(real_x, real_y, button="right")
     elif payload.action == "scroll_down":
         await current_page.mouse.wheel(0, 350)
     elif payload.action == "scroll_up":
