@@ -29,7 +29,6 @@ async def startup_event():
     global playwright_instance, browser, context, pages, active_tab_index
     playwright_instance = await async_playwright().start()
     
-    # Chromium with stealth flags to avoid detection & captcha traps
     browser = await playwright_instance.chromium.launch(
         headless=True,
         args=[
@@ -42,15 +41,15 @@ async def startup_event():
         ]
     )
     
+    # Render 0.1 vCPU Optimized Viewport (854x480)
     context = await browser.new_context(
-        viewport={"width": 1280, "height": 720},
+        viewport={"width": 854, "height": 480},
         device_scale_factor=1,
         is_mobile=False,
         has_touch=False,
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     )
     
-    # Inject script to override navigator.webdriver detection
     await context.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined
@@ -84,12 +83,14 @@ async def frame_generator():
         if pages and active_tab_index < len(pages):
             try:
                 current_page = pages[active_tab_index]
-                screenshot = await current_page.screenshot(type="jpeg", quality=65)
+                # Lower quality & resolution = 10x faster encoding on 0.1 vCPU
+                screenshot = await current_page.screenshot(type="jpeg", quality=35)
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + screenshot + b'\r\n')
             except Exception:
                 pass
-        await asyncio.sleep(0.08)
+        # 0.20s = ~5 FPS (Ideal for 0.1 vCPU stability)
+        await asyncio.sleep(0.20)
 
 @app.get("/screen")
 async def stream_screen():
