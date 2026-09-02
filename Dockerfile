@@ -1,16 +1,13 @@
-FROM python:3.11-slim
+FROM lscr.io/linuxserver/chromium:latest
 
-WORKDIR /app
-
-COPY ./requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --upgrade -r /app/requirements.txt
-
-RUN playwright install --with-deps chromium
-
-COPY . /app
-
-RUN mkdir -p /app/user_data
-
+# Render Environment Port Setup
+ENV PORT=7860
+ENV CUSTOM_PORT=7860
 EXPOSE 7860
 
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-7860}"]
+# Mobile Touch & Performance Optimization Flags for 0.1 vCPU
+ENV CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage --touch-events=enabled --disable-gpu"
+
+# Auto Scale & Resolution configuration
+ENV DISPLAY_WIDTH=1024
+ENV DISPLAY_HEIGHT=600
