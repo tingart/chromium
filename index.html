@@ -134,7 +134,6 @@
     <img id="screenStream" src="/screen" alt="Live Browser Stream" />
   </div>
 
-  <!-- Dock containing Manual Keyboard Toggle Button -->
   <div class="vnc-dock">
     <button class="dock-btn" onclick="toggleFullscreen()">⛶</button>
     <button class="dock-btn" id="rightClickBtn" onclick="toggleMode('rightClick')">🖱️</button>
@@ -142,7 +141,6 @@
     <button class="dock-btn" id="kbBtn" onclick="toggleKeyboard()">⌨️</button>
   </div>
 
-  <!-- Manual Virtual Input Field -->
   <input type="text" id="manualKeyboardInput" style="position:absolute; opacity:0; pointer-events:none;" />
 
 <script>
@@ -230,7 +228,6 @@
     }
   }
 
-  // Toggle Keyboard On / Off from Floating Dock
   function toggleKeyboard() {
     if (document.activeElement === kbInput) {
       kbInput.blur();
@@ -243,12 +240,13 @@
 
   const screenImg = document.getElementById('screenStream');
 
+  // Updated 854x480 coordinate touch mapping
   screenImg.addEventListener('touchstart', (e) => {
     const rect = screenImg.getBoundingClientRect();
     const touch = e.touches[0];
     
-    const scaleX = 1280 / rect.width;
-    const scaleY = 720 / rect.height;
+    const scaleX = 854 / rect.width;
+    const scaleY = 480 / rect.height;
 
     touchStartPos = {
       x: Math.round((touch.clientX - rect.left) * scaleX),
@@ -266,7 +264,7 @@
     if (currentMode === 'scroll') {
       const touch = e.touches[0];
       const rect = screenImg.getBoundingClientRect();
-      const currentY = (touch.clientY - rect.top) * (720 / rect.height);
+      const currentY = (touch.clientY - rect.top) * (480 / rect.height);
       const deltaY = touchStartPos.y - currentY;
       
       const action = deltaY > 0 ? 'scroll_down' : 'scroll_up';
@@ -292,7 +290,6 @@
     });
   }
 
-  // Keyboard Handlers
   kbInput.addEventListener('keydown', async (e) => {
     if (e.key === 'Backspace' || e.key === 'Enter') {
       await fetch(`${API_BASE}/key`, {
