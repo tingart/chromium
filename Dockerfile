@@ -1,17 +1,16 @@
-FROM lscr.io/linuxserver/chromium:latest
+FROM python:3.11-slim
 
-# Render Environment Port Setup
-ENV PORT=7860
-ENV CUSTOM_PORT=7860
+WORKDIR /app
+
+COPY ./requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir --upgrade -r /app/requirements.txt
+
+RUN playwright install --with-deps chromium
+
+COPY . /app
+
+RUN mkdir -p /app/user_data
+
 EXPOSE 7860
 
-# Internal Nginx ko Plain HTTP (NO_TLS) par force karne ke liye
-ENV NO_TLS=1
-ENV SUBFOLDER=/
-
-# Mobile Touch & 0.1 vCPU Performance Flags
-ENV CHROMIUM_FLAGS="--no-sandbox --disable-dev-shm-usage --touch-events=enabled --disable-gpu"
-
-# Screen Resolution Configuration
-ENV DISPLAY_WIDTH=1024
-ENV DISPLAY_HEIGHT=600
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-7860}"]
