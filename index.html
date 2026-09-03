@@ -1,293 +1,2932 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Desktop Remote Experience</title>
-  <style>
-    * {
-      -webkit-touch-callout: none !important;
-      -webkit-user-select: none !important;
-      user-select: none !important;
-      touch-action: none !important;
-      box-sizing: border-box;
-      margin: 0; padding: 0;
-    }
-    body, html {
-      width: 100%; height: 100%;
-      background: #0f0f12;
-      color: #fff;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      overflow: hidden;
-    }
-    .browser-header {
-      height: 48px;
-      background: #18181c;
-      display: flex;
-      align-items: center;
-      padding: 0 8px;
-      gap: 8px;
-      border-bottom: 1px solid #2a2a30;
-    }
-    .tabs-container { display: flex; gap: 4px; overflow-x: auto; max-width: 45%; }
-    .tab-item {
-      background: #232328;
-      padding: 4px 10px;
-      border-radius: 6px 6px 0 0;
-      font-size: 11px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      white-space: nowrap;
-    }
-    .tab-item.active { background: #3b82f6; }
-    .tab-close { cursor: pointer; font-weight: bold; margin-left: 4px; }
-    .url-bar { flex: 1; display: flex; gap: 4px; }
-    .url-input {
-      width: 100%;
-      background: #0f0f12;
-      border: 1px solid #333;
-      color: #fff;
-      padding: 6px 12px;
-      border-radius: 6px;
-      font-size: 13px;
-      -webkit-user-select: text !important;
-      user-select: text !important;
-      touch-action: auto !important;
-    }
-    .vnc-dock {
-      position: fixed;
-      right: 12px;
-      top: 50%;
-      transform: translateY(-50%);
-      background: rgba(24, 24, 28, 0.9);
-      backdrop-filter: blur(8px);
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      border-radius: 20px;
-      padding: 8px 6px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      z-index: 10000;
-    }
-    .dock-btn {
-      width: 42px;
-      height: 42px;
-      border-radius: 12px;
-      background: #2a2a30;
-      color: #fff;
-      border: none;
-      font-size: 16px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .dock-btn.active { background: #3b82f6; }
-    #viewport { width: 100%; height: calc(100vh - 48px); background: #000; display: flex; align-items: center; justify-content: center; }
-    #screenStream { width: 100%; height: 100%; object-fit: contain; }
-  </style>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width,
+             initial-scale=1.0,
+             maximum-scale=1.0,
+             user-scalable=no"
+>
+
+<title>Remote Browser</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #0b0b0e;
+    color: white;
+    font-family:
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        Roboto,
+        sans-serif;
+}
+
+button,
+input,
+select {
+    font: inherit;
+}
+
+
+/* =========================================================
+   HEADER
+   ========================================================= */
+
+.browser-header {
+
+    height: 50px;
+
+    display: flex;
+    align-items: center;
+
+    gap: 6px;
+
+    padding: 5px 7px;
+
+    background: #18181d;
+
+    border-bottom:
+        1px solid #303038;
+
+    z-index: 1000;
+}
+
+
+.tabs-container {
+
+    display: flex;
+
+    gap: 4px;
+
+    max-width: 38%;
+
+    overflow-x: auto;
+
+    scrollbar-width: none;
+}
+
+.tabs-container::-webkit-scrollbar {
+    display: none;
+}
+
+
+.tab-item {
+
+    height: 34px;
+
+    min-width: 90px;
+
+    padding:
+        0 8px;
+
+    display: flex;
+    align-items: center;
+
+    justify-content: space-between;
+
+    gap: 5px;
+
+    background: #25252b;
+
+    border-radius: 8px;
+
+    font-size: 11px;
+
+    white-space: nowrap;
+}
+
+.tab-item.active {
+    background: #315fae;
+}
+
+.tab-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tab-close {
+    font-size: 17px;
+    opacity: .75;
+}
+
+
+.header-btn {
+
+    width: 35px;
+    height: 35px;
+
+    border: none;
+
+    border-radius: 8px;
+
+    background: #28282e;
+
+    color: white;
+
+    font-size: 18px;
+}
+
+
+/* =========================================================
+   URL BAR
+   ========================================================= */
+
+.url-bar {
+
+    flex: 1;
+
+    min-width: 0;
+
+    display: flex;
+
+    gap: 5px;
+}
+
+.url-input {
+
+    flex: 1;
+
+    min-width: 0;
+
+    height: 35px;
+
+    padding:
+        0 12px;
+
+    border:
+        1px solid #383840;
+
+    border-radius: 8px;
+
+    background: #0f0f13;
+
+    color: white;
+
+    outline: none;
+
+    font-size: 13px;
+
+    user-select: text;
+
+    -webkit-user-select: text;
+
+    touch-action: auto;
+}
+
+.url-input:focus {
+    border-color: #4b8cff;
+}
+
+
+.go-btn {
+
+    height: 35px;
+
+    padding: 0 12px;
+
+    border: none;
+
+    border-radius: 8px;
+
+    background: #3677df;
+
+    color: white;
+
+    font-weight: 600;
+}
+
+
+/* =========================================================
+   VIEWPORT
+   ========================================================= */
+
+#viewport {
+
+    position: relative;
+
+    width: 100%;
+
+    height:
+        calc(100vh - 50px);
+
+    background: #000;
+
+    overflow: hidden;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    touch-action: none;
+}
+
+
+#screenStream {
+
+    display: block;
+
+    width: 100%;
+
+    height: 100%;
+
+    /*
+       IMPORTANT:
+       No object-fit: contain.
+       Remote viewport is dynamically matched to this area.
+    */
+
+    object-fit: fill;
+
+    background: black;
+
+    user-select: none;
+
+    -webkit-user-select: none;
+
+    touch-action: none;
+}
+
+
+/* =========================================================
+   MOVABLE TOOL MENU
+   ========================================================= */
+
+#toolPanel {
+
+    position: fixed;
+
+    right: 10px;
+
+    top: 50%;
+
+    transform: translateY(-50%);
+
+    width: 58px;
+
+    padding: 7px;
+
+    border-radius: 18px;
+
+    background:
+        rgba(25, 25, 31, .94);
+
+    border:
+        1px solid rgba(255,255,255,.14);
+
+    box-shadow:
+        0 10px 35px rgba(0,0,0,.5);
+
+    backdrop-filter: blur(12px);
+
+    z-index: 5000;
+
+    touch-action: none;
+}
+
+
+.tool-drag {
+
+    width: 100%;
+
+    height: 20px;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    color: #888;
+
+    font-size: 11px;
+
+    cursor: grab;
+}
+
+
+.tool-btn {
+
+    width: 44px;
+
+    height: 44px;
+
+    margin: 4px auto;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: center;
+
+    border: none;
+
+    border-radius: 13px;
+
+    background: #292930;
+
+    color: white;
+
+    font-size: 18px;
+}
+
+.tool-btn:active {
+    transform: scale(.94);
+}
+
+.tool-btn.active {
+    background: #3978df;
+}
+
+
+/* =========================================================
+   SETTINGS PANEL
+   ========================================================= */
+
+#settingsPanel {
+
+    position: fixed;
+
+    top: 60px;
+
+    right: 75px;
+
+    width: min(330px, calc(100vw - 90px));
+
+    max-height:
+        calc(100vh - 80px);
+
+    overflow-y: auto;
+
+    padding: 15px;
+
+    border-radius: 17px;
+
+    background:
+        rgba(20,20,25,.97);
+
+    border:
+        1px solid #3a3a43;
+
+    box-shadow:
+        0 15px 50px rgba(0,0,0,.6);
+
+    backdrop-filter: blur(15px);
+
+    z-index: 6000;
+
+    display: none;
+
+    scrollbar-width: thin;
+}
+
+#settingsPanel.show {
+    display: block;
+}
+
+
+.settings-title {
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    margin-bottom: 12px;
+
+    font-size: 16px;
+
+    font-weight: 700;
+}
+
+.close-settings {
+
+    border: none;
+
+    background: #303038;
+
+    color: white;
+
+    width: 30px;
+
+    height: 30px;
+
+    border-radius: 8px;
+}
+
+
+.section {
+
+    margin-bottom: 17px;
+
+    padding-bottom: 13px;
+
+    border-bottom:
+        1px solid #303038;
+}
+
+.section:last-child {
+    border-bottom: none;
+}
+
+
+.section-title {
+
+    font-size: 12px;
+
+    color: #8faef0;
+
+    margin-bottom: 9px;
+
+    font-weight: 700;
+
+    text-transform: uppercase;
+}
+
+
+.setting-row {
+
+    margin-bottom: 11px;
+}
+
+.setting-label {
+
+    display: flex;
+
+    justify-content: space-between;
+
+    margin-bottom: 5px;
+
+    font-size: 12px;
+
+    color: #ddd;
+}
+
+
+.setting-control {
+
+    width: 100%;
+}
+
+
+input[type="range"] {
+    width: 100%;
+}
+
+
+select,
+.number-input {
+
+    width: 100%;
+
+    height: 34px;
+
+    border:
+        1px solid #3a3a42;
+
+    border-radius: 8px;
+
+    background: #101014;
+
+    color: white;
+
+    padding: 0 8px;
+
+    outline: none;
+}
+
+
+.small-grid {
+
+    display: grid;
+
+    grid-template-columns: 1fr 1fr;
+
+    gap: 8px;
+}
+
+
+.small-btn {
+
+    height: 35px;
+
+    border: none;
+
+    border-radius: 8px;
+
+    background: #2c2c34;
+
+    color: white;
+}
+
+.small-btn.primary {
+    background: #3677df;
+}
+
+
+.status-box {
+
+    padding: 9px;
+
+    background: #101014;
+
+    border-radius: 8px;
+
+    font-size: 11px;
+
+    line-height: 1.6;
+
+    color: #aaa;
+}
+
+
+/* =========================================================
+   DEBUG OVERLAY
+   ========================================================= */
+
+#debugOverlay {
+
+    position: fixed;
+
+    left: 8px;
+
+    bottom: 8px;
+
+    padding: 6px 8px;
+
+    border-radius: 7px;
+
+    background:
+        rgba(0,0,0,.65);
+
+    color: #9dff9d;
+
+    font:
+        10px monospace;
+
+    z-index: 4500;
+
+    display: none;
+
+    pointer-events: none;
+}
+
+
+#debugOverlay.show {
+    display: block;
+}
+
+
+/* =========================================================
+   LOADING
+   ========================================================= */
+
+#loading {
+
+    position: absolute;
+
+    left: 50%;
+    top: 50%;
+
+    transform:
+        translate(-50%, -50%);
+
+    padding: 10px 14px;
+
+    background:
+        rgba(0,0,0,.65);
+
+    border-radius: 10px;
+
+    font-size: 12px;
+
+    z-index: 20;
+
+    pointer-events: none;
+}
+
+</style>
+
 </head>
+
+
 <body>
 
-  <div class="browser-header">
-    <div class="tabs-container" id="tabsList"></div>
-    <button onclick="addTab()" style="background:none; border:none; color:#fff; font-size:18px; padding:0 6px;">+</button>
+
+<!-- ========================================================
+     HEADER
+========================================================= -->
+
+<div class="browser-header">
+
+    <div
+        class="tabs-container"
+        id="tabsList"
+    ></div>
+
+    <button
+        class="header-btn"
+        onclick="addTab()"
+    >
+        +
+    </button>
+
+    <button
+        class="header-btn"
+        onclick="goBack()"
+    >
+        ‹
+    </button>
+
+    <button
+        class="header-btn"
+        onclick="goForward()"
+    >
+        ›
+    </button>
+
     <div class="url-bar">
-      <input type="text" id="urlInput" class="url-input" placeholder="Search or type web address" />
-      <button onclick="triggerNavigate()" style="padding:0 12px; background:#3b82f6; border:none; color:#fff; border-radius:6px; font-weight:bold;">Go</button>
+
+        <input
+            id="urlInput"
+            class="url-input"
+            type="text"
+            autocomplete="off"
+            placeholder="Search or type web address"
+        >
+
+        <button
+            class="go-btn"
+            onclick="triggerNavigate()"
+        >
+            Go
+        </button>
+
     </div>
-  </div>
 
-  <div id="viewport">
-    <img id="screenStream" src="/screen" alt="Live Browser Stream" />
-  </div>
+</div>
 
-  <div class="vnc-dock">
-    <button class="dock-btn" onclick="toggleFullscreen()">⛶</button>
-    <button class="dock-btn" id="rightClickBtn" onclick="toggleMode('rightClick')">🖱️</button>
-    <button class="dock-btn" id="scrollBtn" onclick="toggleMode('scroll')">📜</button>
-    <button class="dock-btn" id="kbBtn" onclick="toggleKeyboard()">⌨️</button>
-  </div>
 
-  <input type="text" id="manualKeyboardInput" style="position:absolute; opacity:0; pointer-events:none;" />
+<!-- ========================================================
+     REMOTE SCREEN
+========================================================= -->
+
+<div id="viewport">
+
+    <img
+        id="screenStream"
+        src="/screen"
+        alt="Remote Browser"
+        draggable="false"
+    >
+
+    <div id="loading">
+        Connecting...
+    </div>
+
+</div>
+
+
+<!-- ========================================================
+     MOVABLE TOOL PANEL
+========================================================= -->
+
+<div id="toolPanel">
+
+    <div
+        class="tool-drag"
+        id="toolDrag"
+        title="Drag"
+    >
+        ⋮⋮
+    </div>
+
+    <button
+        class="tool-btn"
+        onclick="toggleFullscreen()"
+        title="Fullscreen"
+    >
+        ⛶
+    </button>
+
+    <button
+        class="tool-btn"
+        id="rightClickBtn"
+        onclick="toggleMode('rightClick')"
+        title="Right click"
+    >
+        🖱️
+    </button>
+
+    <button
+        class="tool-btn"
+        id="scrollBtn"
+        onclick="toggleMode('scroll')"
+        title="Scroll"
+    >
+        📜
+    </button>
+
+    <button
+        class="tool-btn"
+        id="kbBtn"
+        onclick="toggleKeyboard()"
+        title="Keyboard"
+    >
+        ⌨️
+    </button>
+
+    <button
+        class="tool-btn"
+        onclick="toggleSettings()"
+        title="Settings"
+    >
+        ⚙️
+    </button>
+
+    <button
+        class="tool-btn"
+        onclick="forceRefresh()"
+        title="Refresh stream"
+    >
+        🔄
+    </button>
+
+</div>
+
+
+<!-- ========================================================
+     SETTINGS
+========================================================= -->
+
+<div id="settingsPanel">
+
+    <div class="settings-title">
+
+        <span>Browser Controls</span>
+
+        <button
+            class="close-settings"
+            onclick="toggleSettings()"
+        >
+            ×
+        </button>
+
+    </div>
+
+
+    <!-- STREAM -->
+
+    <div class="section">
+
+        <div class="section-title">
+            🎞 Stream
+        </div>
+
+
+        <div class="setting-row">
+
+            <div class="setting-label">
+                <span>Image format</span>
+                <span id="formatValue">JPEG</span>
+            </div>
+
+            <select
+                id="formatSetting"
+                class="setting-control"
+            >
+                <option value="jpeg">
+                    JPEG — Fast
+                </option>
+
+                <option value="png">
+                    PNG — Sharp / Heavy
+                </option>
+            </select>
+
+        </div>
+
+
+        <div class="setting-row">
+
+            <div class="setting-label">
+
+                <span>JPEG quality</span>
+
+                <span id="qualityValue">
+                    35
+                </span>
+
+            </div>
+
+            <input
+                id="qualitySetting"
+                type="range"
+                min="10"
+                max="80"
+                value="35"
+            >
+
+        </div>
+
+
+        <div class="setting-row">
+
+            <div class="setting-label">
+
+                <span>Idle update</span>
+
+                <span id="intervalValue">
+                    700ms
+                </span>
+
+            </div>
+
+            <input
+                id="intervalSetting"
+                type="range"
+                min="100"
+                max="3000"
+                step="100"
+                value="700"
+            >
+
+        </div>
+
+
+        <div class="small-grid">
+
+            <button
+                class="small-btn"
+                onclick="setFastStream()"
+            >
+                ⚡ Fast
+            </button>
+
+            <button
+                class="small-btn"
+                onclick="setBalancedStream()"
+            >
+                ⚖️ Balanced
+            </button>
+
+        </div>
+
+    </div>
+
+
+    <!-- RESOLUTION -->
+
+    <div class="section">
+
+        <div class="section-title">
+            🖥 Resolution
+        </div>
+
+
+        <div class="setting-row">
+
+            <div class="setting-label">
+                <span>Remote width</span>
+                <span id="widthValue">854</span>
+            </div>
+
+            <input
+                id="widthSetting"
+                type="range"
+                min="240"
+                max="1200"
+                step="10"
+                value="854"
+            >
+
+        </div>
+
+
+        <div class="setting-row">
+
+            <div class="setting-label">
+                <span>Remote height</span>
+                <span id="heightValue">480</span>
+            </div>
+
+            <input
+                id="heightSetting"
+                type="range"
+                min="180"
+                max="1000"
+                step="10"
+                value="480"
+            >
+
+        </div>
+
+
+        <button
+            class="small-btn primary"
+            style="width:100%"
+            onclick="fitRemoteScreen()"
+        >
+            📱 Match My Screen
+        </button>
+
+    </div>
+
+
+    <!-- TOUCH -->
+
+    <div class="section">
+
+        <div class="section-title">
+            👆 Touch Calibration
+        </div>
+
+
+        <div class="setting-row">
+
+            <div class="setting-label">
+                <span>Touch X scale</span>
+                <span id="touchScaleXValue">1.00</span>
+            </div>
+
+            <input
+                id="touchScaleX"
+                type="range"
+                min="0.80"
+                max="1.20"
+                step="0.01"
+                value="1"
+            >
+
+        </div>
+
+
+        <div class="setting-row">
+
+            <div class="setting-label">
+                <span>Touch Y scale</span>
+                <span id="touchScaleYValue">1.00</span>
+            </div>
+
+            <input
+                id="touchScaleY"
+                type="range"
+                min="0.80"
+                max="1.20"
+                step="0.01"
+                value="1"
+            >
+
+        </div>
+
+
+        <div class="small-grid">
+
+            <div>
+
+                <div class="setting-label">
+                    <span>X offset</span>
+                </div>
+
+                <input
+                    id="touchOffsetX"
+                    class="number-input"
+                    type="number"
+                    value="0"
+                    step="1"
+                >
+
+            </div>
+
+
+            <div>
+
+                <div class="setting-label">
+                    <span>Y offset</span>
+                </div>
+
+                <input
+                    id="touchOffsetY"
+                    class="number-input"
+                    type="number"
+                    value="0"
+                    step="1"
+                >
+
+            </div>
+
+        </div>
+
+
+        <div class="setting-row">
+
+            <div class="setting-label">
+
+                <span>Long press</span>
+
+                <span id="longPressValue">
+                    600ms
+                </span>
+
+            </div>
+
+            <input
+                id="longPressSetting"
+                type="range"
+                min="300"
+                max="1500"
+                step="50"
+                value="600"
+            >
+
+        </div>
+
+
+        <div class="setting-row">
+
+            <div class="setting-label">
+
+                <span>Scroll sensitivity</span>
+
+                <span id="scrollValue">
+                    350
+                </span>
+
+            </div>
+
+            <input
+                id="scrollSetting"
+                type="range"
+                min="50"
+                max="1000"
+                step="50"
+                value="350"
+            >
+
+        </div>
+
+
+        <div class="small-grid">
+
+            <button
+                class="small-btn"
+                onclick="resetTouch()"
+            >
+                Reset
+            </button>
+
+            <button
+                class="small-btn primary"
+                onclick="toggleDebug()"
+            >
+                Debug
+            </button>
+
+        </div>
+
+    </div>
+
+
+    <!-- INFORMATION -->
+
+    <div class="section">
+
+        <div class="section-title">
+            📊 Live Status
+        </div>
+
+        <div
+            class="status-box"
+            id="statusBox"
+        >
+            Loading...
+        </div>
+
+    </div>
+
+
+    <!-- SAVE -->
+
+    <div class="small-grid">
+
+        <button
+            class="small-btn"
+            onclick="resetAllSettings()"
+        >
+            Reset All
+        </button>
+
+        <button
+            class="small-btn primary"
+            onclick="applyAllSettings()"
+        >
+            Apply
+        </button>
+
+    </div>
+
+</div>
+
+
+<div id="debugOverlay"></div>
+
+
+<!-- Hidden keyboard input -->
+
+<input
+    id="manualKeyboardInput"
+    type="text"
+    autocomplete="off"
+    autocorrect="off"
+    autocapitalize="off"
+    spellcheck="false"
+    style="
+        position:fixed;
+        left:-1000px;
+        top:-1000px;
+        width:1px;
+        height:1px;
+        opacity:0;
+    "
+>
+
 
 <script>
-  const API_BASE = window.location.origin;
-  let tabs = [];
-  let activeTabIndex = 0;
-  let currentMode = 'normal';
-  let touchTimer = null;
-  let touchStartPos = { x: 0, y: 0 };
-  const kbInput = document.getElementById('manualKeyboardInput');
 
-  window.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); return false; };
+/* =========================================================
+   GLOBALS
+========================================================= */
 
-  async function fetchTabs() {
+const API_BASE = window.location.origin;
+
+const viewport =
+    document.getElementById("viewport");
+
+const screenImg =
+    document.getElementById("screenStream");
+
+const kbInput =
+    document.getElementById(
+        "manualKeyboardInput"
+    );
+
+let tabs = [];
+
+let activeTabIndex = 0;
+
+let currentMode = "normal";
+
+let touchTimer = null;
+
+let touchStart = {
+    x: 0,
+    y: 0
+};
+
+let remoteViewport = {
+    width: 854,
+    height: 480
+};
+
+let settings = {
+
+    format: "jpeg",
+
+    quality: 35,
+
+    interval: 700,
+
+    width: 854,
+
+    height: 480,
+
+    touchScaleX: 1,
+
+    touchScaleY: 1,
+
+    touchOffsetX: 0,
+
+    touchOffsetY: 0,
+
+    longPress: 600,
+
+    scrollSensitivity: 350
+
+};
+
+
+/* =========================================================
+   LOCAL STORAGE
+========================================================= */
+
+function saveLocalSettings() {
+
+    localStorage.setItem(
+        "remoteBrowserSettings",
+        JSON.stringify(settings)
+    );
+}
+
+
+function loadLocalSettings() {
+
     try {
-      const res = await fetch(`${API_BASE}/tabs`);
-      const data = await res.json();
-      tabs = data.tabs;
-      activeTabIndex = data.active_index;
-      renderTabs();
-    } catch (e) { console.error(e); }
-  }
 
-  function renderTabs() {
-    const list = document.getElementById('tabsList');
-    list.innerHTML = '';
-    tabs.forEach((tab, index) => {
-      const el = document.createElement('div');
-      el.className = `tab-item ${index === activeTabIndex ? 'active' : ''}`;
-      el.innerHTML = `
-        <span onclick="switchTab(${index})">${index + 1}. ${(tab.title || 'Tab').substring(0, 8)}</span>
-        <span class="tab-close" onclick="closeTab(${index})">×</span>
-      `;
-      list.appendChild(el);
-    });
+        const saved =
+            localStorage.getItem(
+                "remoteBrowserSettings"
+            );
+
+        if (saved) {
+
+            settings = {
+                ...settings,
+                ...JSON.parse(saved)
+            };
+
+        }
+
+    } catch (e) {}
+
+}
+
+
+/* =========================================================
+   API
+========================================================= */
+
+async function api(
+    url,
+    options = {}
+) {
+
+    try {
+
+        const response =
+            await fetch(
+                API_BASE + url,
+                options
+            );
+
+        return await response.json();
+
+    } catch (e) {
+
+        console.log(e);
+
+        return null;
+    }
+}
+
+
+/* =========================================================
+   TABS
+========================================================= */
+
+async function fetchTabs() {
+
+    const data =
+        await api("/tabs");
+
+    if (!data) return;
+
+    tabs = data.tabs;
+
+    activeTabIndex =
+        data.active_index;
+
+    renderTabs();
+}
+
+
+function renderTabs() {
+
+    const list =
+        document.getElementById(
+            "tabsList"
+        );
+
+    list.innerHTML = "";
+
+    tabs.forEach(
+        (tab, index) => {
+
+            const el =
+                document.createElement(
+                    "div"
+                );
+
+            el.className =
+                "tab-item " +
+                (
+                    index === activeTabIndex
+                    ? "active"
+                    : ""
+                );
+
+            el.innerHTML = `
+
+                <span
+                    class="tab-title"
+                    onclick="switchTab(${index})"
+                >
+                    ${index + 1}.
+                    ${(tab.title || "Tab")
+                        .substring(0, 12)}
+                </span>
+
+                <span
+                    class="tab-close"
+                    onclick="closeTab(${index})"
+                >
+                    ×
+                </span>
+            `;
+
+            list.appendChild(el);
+
+        }
+    );
+
     if (tabs[activeTabIndex]) {
-      document.getElementById('urlInput').value = tabs[activeTabIndex].url;
+
+        document.getElementById(
+            "urlInput"
+        ).value =
+            tabs[activeTabIndex].url;
     }
-  }
+}
 
-  async function triggerNavigate() {
-    const url = document.getElementById('urlInput').value;
-    await fetch(`${API_BASE}/navigate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: url })
-    });
+
+async function addTab() {
+
+    await api(
+        "/tabs/new",
+        {
+            method: "POST"
+        }
+    );
+
     fetchTabs();
-  }
+}
 
-  async function addTab() {
-    await fetch(`${API_BASE}/tabs/new`, { method: 'POST' });
+
+async function switchTab(index) {
+
+    await api(
+        "/tabs/switch",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json"
+            },
+
+            body: JSON.stringify({
+                index
+            })
+        }
+    );
+
     fetchTabs();
-  }
+}
 
-  async function switchTab(idx) {
-    await fetch(`${API_BASE}/tabs/switch`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ index: idx })
-    });
+
+async function closeTab(index) {
+
+    await api(
+        "/tabs/close",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json"
+            },
+
+            body: JSON.stringify({
+                index
+            })
+        }
+    );
+
     fetchTabs();
-  }
+}
 
-  async function closeTab(idx) {
-    await fetch(`${API_BASE}/tabs/close`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ index: idx })
-    });
+
+/* =========================================================
+   NAVIGATION
+========================================================= */
+
+async function triggerNavigate() {
+
+    const input =
+        document.getElementById(
+            "urlInput"
+        );
+
+    const url =
+        input.value.trim();
+
+    if (!url) return;
+
+    document.getElementById(
+        "loading"
+    ).textContent =
+        "Loading...";
+
+    await api(
+        "/navigate",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json"
+            },
+
+            body: JSON.stringify({
+                url
+            })
+        }
+    );
+
     fetchTabs();
-  }
+}
 
-  function toggleMode(mode) {
-    currentMode = (currentMode === mode) ? 'normal' : mode;
-    document.getElementById('rightClickBtn').classList.toggle('active', currentMode === 'rightClick');
-    document.getElementById('scrollBtn').classList.toggle('active', currentMode === 'scroll');
-  }
 
-  function toggleFullscreen() {
-    if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen();
+document.getElementById(
+    "urlInput"
+).addEventListener(
+    "keydown",
+    e => {
+
+        if (e.key === "Enter") {
+            triggerNavigate();
+        }
+
+    }
+);
+
+
+/* =========================================================
+   BACK / FORWARD
+========================================================= */
+
+async function goBack() {
+
+    await sendBrowserAction(
+        "goBack"
+    );
+}
+
+
+async function goForward() {
+
+    await sendBrowserAction(
+        "goForward"
+    );
+}
+
+
+async function sendBrowserAction(
+    action
+) {
+
+    const page =
+        await api(
+            "/tabs"
+        );
+
+    if (!page) return;
+
+    /*
+       Browser history is handled by
+       navigation JavaScript below.
+       This section intentionally uses
+       a dedicated backend endpoint when
+       available.
+    */
+
+    if (action === "goBack") {
+
+        await api(
+            "/navigate",
+            {
+                method: "POST",
+
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body: JSON.stringify({
+                    url: "javascript:history.back()"
+                })
+            }
+        );
+
+    }
+
+}
+
+
+/* =========================================================
+   STREAM SETTINGS
+========================================================= */
+
+function updateSettingUI() {
+
+    document.getElementById(
+        "formatSetting"
+    ).value =
+        settings.format;
+
+    document.getElementById(
+        "qualitySetting"
+    ).value =
+        settings.quality;
+
+    document.getElementById(
+        "intervalSetting"
+    ).value =
+        settings.interval;
+
+    document.getElementById(
+        "widthSetting"
+    ).value =
+        settings.width;
+
+    document.getElementById(
+        "heightSetting"
+    ).value =
+        settings.height;
+
+    document.getElementById(
+        "touchScaleX"
+    ).value =
+        settings.touchScaleX;
+
+    document.getElementById(
+        "touchScaleY"
+    ).value =
+        settings.touchScaleY;
+
+    document.getElementById(
+        "touchOffsetX"
+    ).value =
+        settings.touchOffsetX;
+
+    document.getElementById(
+        "touchOffsetY"
+    ).value =
+        settings.touchOffsetY;
+
+    document.getElementById(
+        "longPressSetting"
+    ).value =
+        settings.longPress;
+
+    document.getElementById(
+        "scrollSetting"
+    ).value =
+        settings.scrollSensitivity;
+
+    updateSettingLabels();
+}
+
+
+function updateSettingLabels() {
+
+    document.getElementById(
+        "formatValue"
+    ).textContent =
+        settings.format.toUpperCase();
+
+    document.getElementById(
+        "qualityValue"
+    ).textContent =
+        settings.quality;
+
+    document.getElementById(
+        "intervalValue"
+    ).textContent =
+        settings.interval + "ms";
+
+    document.getElementById(
+        "widthValue"
+    ).textContent =
+        settings.width;
+
+    document.getElementById(
+        "heightValue"
+    ).textContent =
+        settings.height;
+
+    document.getElementById(
+        "touchScaleXValue"
+    ).textContent =
+        Number(settings.touchScaleX)
+            .toFixed(2);
+
+    document.getElementById(
+        "touchScaleYValue"
+    ).textContent =
+        Number(settings.touchScaleY)
+            .toFixed(2);
+
+    document.getElementById(
+        "longPressValue"
+    ).textContent =
+        settings.longPress + "ms";
+
+    document.getElementById(
+        "scrollValue"
+    ).textContent =
+        settings.scrollSensitivity;
+}
+
+
+/* =========================================================
+   LIVE CONTROL EVENTS
+========================================================= */
+
+document.getElementById(
+    "formatSetting"
+).onchange = e => {
+
+    settings.format =
+        e.target.value;
+
+    applyStreamOnly();
+};
+
+
+document.getElementById(
+    "qualitySetting"
+).oninput = e => {
+
+    settings.quality =
+        Number(e.target.value);
+
+    updateSettingLabels();
+};
+
+
+document.getElementById(
+    "intervalSetting"
+).oninput = e => {
+
+    settings.interval =
+        Number(e.target.value);
+
+    updateSettingLabels();
+};
+
+
+document.getElementById(
+    "widthSetting"
+).oninput = e => {
+
+    settings.width =
+        Number(e.target.value);
+
+    updateSettingLabels();
+};
+
+
+document.getElementById(
+    "heightSetting"
+).oninput = e => {
+
+    settings.height =
+        Number(e.target.value);
+
+    updateSettingLabels();
+};
+
+
+document.getElementById(
+    "touchScaleX"
+).oninput = e => {
+
+    settings.touchScaleX =
+        Number(e.target.value);
+
+    updateSettingLabels();
+};
+
+
+document.getElementById(
+    "touchScaleY"
+).oninput = e => {
+
+    settings.touchScaleY =
+        Number(e.target.value);
+
+    updateSettingLabels();
+};
+
+
+document.getElementById(
+    "touchOffsetX"
+).oninput = e => {
+
+    settings.touchOffsetX =
+        Number(e.target.value);
+
+    updateSettingLabels();
+};
+
+
+document.getElementById(
+    "touchOffsetY"
+).oninput = e => {
+
+    settings.touchOffsetY =
+        Number(e.target.value);
+
+    updateSettingLabels();
+};
+
+
+document.getElementById(
+    "longPressSetting"
+).oninput = e => {
+
+    settings.longPress =
+        Number(e.target.value);
+
+    updateSettingLabels();
+};
+
+
+document.getElementById(
+    "scrollSetting"
+).oninput = e => {
+
+    settings.scrollSensitivity =
+        Number(e.target.value);
+
+    updateSettingLabels();
+};
+
+
+/* =========================================================
+   APPLY SETTINGS
+========================================================= */
+
+async function applyStreamOnly() {
+
+    await api(
+        "/settings",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json"
+            },
+
+            body: JSON.stringify({
+                format:
+                    settings.format,
+
+                quality:
+                    settings.quality,
+
+                interval:
+                    settings.interval
+            })
+        }
+    );
+
+    saveLocalSettings();
+
+    updateSettingLabels();
+}
+
+
+async function applyAllSettings() {
+
+    await api(
+        "/settings",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json"
+            },
+
+            body: JSON.stringify({
+
+                format:
+                    settings.format,
+
+                quality:
+                    settings.quality,
+
+                interval:
+                    settings.interval,
+
+                width:
+                    settings.width,
+
+                height:
+                    settings.height
+            })
+        }
+    );
+
+    saveLocalSettings();
+
+    await syncViewport();
+
+    updateSettingLabels();
+
+    updateStatus();
+}
+
+
+/* =========================================================
+   PRESETS
+========================================================= */
+
+function setFastStream() {
+
+    settings.format = "jpeg";
+
+    settings.quality = 25;
+
+    settings.interval = 1000;
+
+    updateSettingUI();
+
+    applyStreamOnly();
+}
+
+
+function setBalancedStream() {
+
+    settings.format = "jpeg";
+
+    settings.quality = 35;
+
+    settings.interval = 700;
+
+    updateSettingUI();
+
+    applyStreamOnly();
+}
+
+
+/* =========================================================
+   MATCH SCREEN
+========================================================= */
+
+async function fitRemoteScreen() {
+
+    const rect =
+        viewport.getBoundingClientRect();
+
+    settings.width =
+        Math.round(rect.width);
+
+    settings.height =
+        Math.round(rect.height);
+
+    updateSettingUI();
+
+    await syncViewport();
+}
+
+
+async function syncViewport() {
+
+    const rect =
+        viewport.getBoundingClientRect();
+
+    let width =
+        Math.round(rect.width);
+
+    let height =
+        Math.round(rect.height);
+
+    if (
+        width < 100 ||
+        height < 100
+    ) {
+        return;
+    }
+
+    const data =
+        await api(
+            "/viewport",
+            {
+                method: "POST",
+
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body: JSON.stringify({
+                    width,
+                    height
+                })
+            }
+        );
+
+    if (!data) return;
+
+    remoteViewport.width =
+        data.width;
+
+    remoteViewport.height =
+        data.height;
+
+    settings.width =
+        data.width;
+
+    settings.height =
+        data.height;
+
+    updateSettingUI();
+
+    updateDebug();
+}
+
+
+/* =========================================================
+   RESPONSIVE VIEWPORT
+========================================================= */
+
+let resizeTimer = null;
+
+function scheduleViewportSync() {
+
+    clearTimeout(resizeTimer);
+
+    resizeTimer =
+        setTimeout(
+            () => {
+                syncViewport();
+            },
+            250
+        );
+}
+
+
+window.addEventListener(
+    "resize",
+    scheduleViewportSync
+);
+
+
+window.addEventListener(
+    "orientationchange",
+    scheduleViewportSync
+);
+
+
+document.addEventListener(
+    "fullscreenchange",
+    scheduleViewportSync
+);
+
+
+/* =========================================================
+   TOUCH MODE
+========================================================= */
+
+function toggleMode(mode) {
+
+    if (
+        currentMode === mode
+    ) {
+        currentMode = "normal";
     } else {
-      document.exitFullscreen();
+        currentMode = mode;
     }
-  }
 
-  function toggleKeyboard() {
-    if (document.activeElement === kbInput) {
-      kbInput.blur();
-      document.getElementById('kbBtn').classList.remove('active');
+    document.getElementById(
+        "rightClickBtn"
+    ).classList.toggle(
+        "active",
+        currentMode === "rightClick"
+    );
+
+    document.getElementById(
+        "scrollBtn"
+    ).classList.toggle(
+        "active",
+        currentMode === "scroll"
+    );
+}
+
+
+/* =========================================================
+   TOUCH COORDINATE CALCULATION
+========================================================= */
+
+function getRemoteCoordinates(
+    clientX,
+    clientY
+) {
+
+    const rect =
+        screenImg.getBoundingClientRect();
+
+    /*
+       Calculate relative position
+       INSIDE THE ACTUAL IMAGE.
+    */
+
+    let rx =
+        (clientX - rect.left)
+        / rect.width;
+
+    let ry =
+        (clientY - rect.top)
+        / rect.height;
+
+
+    /*
+       Convert to remote browser
+       coordinates.
+    */
+
+    let x =
+        rx * remoteViewport.width;
+
+    let y =
+        ry * remoteViewport.height;
+
+
+    /*
+       Manual calibration controls.
+    */
+
+    x =
+        x * Number(settings.touchScaleX)
+        + Number(settings.touchOffsetX);
+
+    y =
+        y * Number(settings.touchScaleY)
+        + Number(settings.touchOffsetY);
+
+
+    /*
+       Clamp.
+    */
+
+    x =
+        Math.max(
+            0,
+            Math.min(
+                remoteViewport.width - 1,
+                x
+            )
+        );
+
+    y =
+        Math.max(
+            0,
+            Math.min(
+                remoteViewport.height - 1,
+                y
+            )
+        );
+
+    return {
+        x: Math.round(x),
+        y: Math.round(y)
+    };
+}
+
+
+/* =========================================================
+   SEND TOUCH
+========================================================= */
+
+async function sendTouchEvent(
+    x,
+    y,
+    action
+) {
+
+    await api(
+        "/touch",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json"
+            },
+
+            body: JSON.stringify({
+                x,
+                y,
+                action
+            })
+        }
+    );
+
+    updateDebug(
+        x,
+        y,
+        action
+    );
+}
+
+
+/* =========================================================
+   TOUCH START
+========================================================= */
+
+screenImg.addEventListener(
+    "touchstart",
+    e => {
+
+        e.preventDefault();
+
+        const touch =
+            e.touches[0];
+
+        const pos =
+            getRemoteCoordinates(
+                touch.clientX,
+                touch.clientY
+            );
+
+        touchStart = pos;
+
+        clearTimeout(
+            touchTimer
+        );
+
+        /*
+           Long press becomes right click.
+        */
+
+        touchTimer =
+            setTimeout(
+                () => {
+
+                    sendTouchEvent(
+                        touchStart.x,
+                        touchStart.y,
+                        "right_click"
+                    );
+
+                    touchTimer = null;
+
+                },
+                Number(
+                    settings.longPress
+                )
+            );
+
+    },
+    {
+        passive: false
+    }
+);
+
+
+/* =========================================================
+   TOUCH MOVE
+========================================================= */
+
+screenImg.addEventListener(
+    "touchmove",
+    e => {
+
+        e.preventDefault();
+
+        if (touchTimer) {
+
+            clearTimeout(
+                touchTimer
+            );
+
+            touchTimer = null;
+        }
+
+
+        if (
+            currentMode !== "scroll"
+        ) {
+            return;
+        }
+
+
+        const touch =
+            e.touches[0];
+
+        const pos =
+            getRemoteCoordinates(
+                touch.clientX,
+                touch.clientY
+            );
+
+
+        const delta =
+            touchStart.y - pos.y;
+
+
+        if (
+            Math.abs(delta) >= 3
+        ) {
+
+            if (delta > 0) {
+
+                sendTouchEvent(
+                    pos.x,
+                    pos.y,
+                    "scroll_down"
+                );
+
+            } else {
+
+                sendTouchEvent(
+                    pos.x,
+                    pos.y,
+                    "scroll_up"
+                );
+
+            }
+
+            touchStart =
+                pos;
+        }
+
+    },
+    {
+        passive: false
+    }
+);
+
+
+/* =========================================================
+   TOUCH END
+========================================================= */
+
+screenImg.addEventListener(
+    "touchend",
+    e => {
+
+        e.preventDefault();
+
+        if (touchTimer) {
+
+            clearTimeout(
+                touchTimer
+            );
+
+            touchTimer = null;
+
+
+            if (
+                currentMode ===
+                "rightClick"
+            ) {
+
+                sendTouchEvent(
+                    touchStart.x,
+                    touchStart.y,
+                    "right_click"
+                );
+
+                currentMode =
+                    "normal";
+
+            } else {
+
+                sendTouchEvent(
+                    touchStart.x,
+                    touchStart.y,
+                    "click"
+                );
+            }
+
+            updateModeButtons();
+        }
+
+    },
+    {
+        passive: false
+    }
+);
+
+
+function updateModeButtons() {
+
+    document.getElementById(
+        "rightClickBtn"
+    ).classList.toggle(
+        "active",
+        currentMode === "rightClick"
+    );
+
+    document.getElementById(
+        "scrollBtn"
+    ).classList.toggle(
+        "active",
+        currentMode === "scroll"
+    );
+}
+
+
+/* =========================================================
+   KEYBOARD
+========================================================= */
+
+function toggleKeyboard() {
+
+    const btn =
+        document.getElementById(
+            "kbBtn"
+        );
+
+    if (
+        document.activeElement ===
+        kbInput
+    ) {
+
+        kbInput.blur();
+
+        btn.classList.remove(
+            "active"
+        );
+
     } else {
-      kbInput.focus();
-      document.getElementById('kbBtn').classList.add('active');
+
+        kbInput.focus();
+
+        btn.classList.add(
+            "active"
+        );
+
     }
-  }
+}
 
-  const screenImg = document.getElementById('screenStream');
 
-  // Touch mapping using actual mobile screen size
-  screenImg.addEventListener('touchstart', (e) => {
-    const rect = screenImg.getBoundingClientRect();
-    const touch = e.touches[0];
+kbInput.addEventListener(
+    "keydown",
+    async e => {
 
-    const scaleX = window.innerWidth / rect.width;
-    const scaleY = window.innerHeight / rect.height;
+        e.stopPropagation();
 
-    touchStartPos = {
-      x: Math.round((touch.clientX - rect.left) * scaleX),
-      y: Math.round((touch.clientY - rect.top) * scaleY)
+        if (
+            e.key === "Backspace" ||
+            e.key === "Enter" ||
+            e.key === "Tab" ||
+            e.key === "Escape" ||
+            e.key === "ArrowUp" ||
+            e.key === "ArrowDown" ||
+            e.key === "ArrowLeft" ||
+            e.key === "ArrowRight" ||
+            e.key === "Delete"
+        ) {
+
+            await sendKey(
+                e.key
+            );
+
+            e.preventDefault();
+        }
+
+    }
+);
+
+
+kbInput.addEventListener(
+    "input",
+    async e => {
+
+        const value =
+            e.target.value;
+
+        if (!value) return;
+
+        const chars =
+            [...value];
+
+        for (
+            const char of chars
+        ) {
+
+            await sendKey(
+                char
+            );
+        }
+
+        e.target.value = "";
+    }
+);
+
+
+async function sendKey(key) {
+
+    await api(
+        "/key",
+        {
+            method: "POST",
+
+            headers: {
+                "Content-Type":
+                    "application/json"
+            },
+
+            body: JSON.stringify({
+                key
+            })
+        }
+    );
+}
+
+
+/* =========================================================
+   FULLSCREEN
+========================================================= */
+
+async function toggleFullscreen() {
+
+    try {
+
+        if (
+            !document.fullscreenElement
+        ) {
+
+            await document
+                .documentElement
+                .requestFullscreen();
+
+        } else {
+
+            await document
+                .exitFullscreen();
+        }
+
+    } catch (e) {}
+
+}
+
+
+/* =========================================================
+   SETTINGS PANEL
+========================================================= */
+
+function toggleSettings() {
+
+    document.getElementById(
+        "settingsPanel"
+    ).classList.toggle(
+        "show"
+    );
+
+    updateStatus();
+}
+
+
+function updateStatus() {
+
+    const box =
+        document.getElementById(
+            "statusBox"
+        );
+
+    box.innerHTML = `
+
+        Remote:
+        ${remoteViewport.width}
+        ×
+        ${remoteViewport.height}
+        <br>
+
+        Format:
+        ${settings.format.toUpperCase()}
+        <br>
+
+        Quality:
+        ${settings.quality}
+        <br>
+
+        Update:
+        ${settings.interval} ms
+        <br>
+
+        Touch:
+        ${Number(
+            settings.touchScaleX
+        ).toFixed(2)}
+        ×
+        ${Number(
+            settings.touchScaleY
+        ).toFixed(2)}
+
+    `;
+}
+
+
+/* =========================================================
+   DEBUG
+========================================================= */
+
+let debugEnabled = false;
+
+
+function toggleDebug() {
+
+    debugEnabled =
+        !debugEnabled;
+
+    document.getElementById(
+        "debugOverlay"
+    ).classList.toggle(
+        "show",
+        debugEnabled
+    );
+
+    updateDebug();
+}
+
+
+function updateDebug(
+    x = null,
+    y = null,
+    action = ""
+) {
+
+    if (!debugEnabled) {
+        return;
+    }
+
+    const overlay =
+        document.getElementById(
+            "debugOverlay"
+        );
+
+    const rect =
+        screenImg.getBoundingClientRect();
+
+    overlay.textContent =
+        `remote: ${remoteViewport.width}×${remoteViewport.height} | ` +
+        `screen: ${Math.round(rect.width)}×${Math.round(rect.height)} | ` +
+        (
+            x !== null
+            ? `touch: ${x},${y} ${action}`
+            : "touch: -"
+        );
+}
+
+
+/* =========================================================
+   RESET TOUCH
+========================================================= */
+
+function resetTouch() {
+
+    settings.touchScaleX = 1;
+
+    settings.touchScaleY = 1;
+
+    settings.touchOffsetX = 0;
+
+    settings.touchOffsetY = 0;
+
+    settings.longPress = 600;
+
+    settings.scrollSensitivity = 350;
+
+    updateSettingUI();
+
+    saveLocalSettings();
+}
+
+
+/* =========================================================
+   RESET EVERYTHING
+========================================================= */
+
+function resetAllSettings() {
+
+    settings = {
+
+        format: "jpeg",
+
+        quality: 35,
+
+        interval: 700,
+
+        width: 854,
+
+        height: 480,
+
+        touchScaleX: 1,
+
+        touchScaleY: 1,
+
+        touchOffsetX: 0,
+
+        touchOffsetY: 0,
+
+        longPress: 600,
+
+        scrollSensitivity: 350
     };
 
-    touchTimer = setTimeout(() => {
-      sendTouchEvent(touchStartPos.x, touchStartPos.y, 'right_click');
-      touchTimer = null;
-    }, 600
-                              });
+    updateSettingUI();
 
-  screenImg.addEventListener('touchmove', (e) => {
-    if (touchTimer) clearTimeout(touchTimer);
-    if (currentMode === 'scroll') {
-      const touch = e.touches[0];
-      const rect = screenImg.getBoundingClientRect();
-      const currentY = (touch.clientY - rect.top) * (window.innerHeight / rect.height);
-      const deltaY = touchStartPos.y - currentY;
+    saveLocalSettings();
 
-      const action = deltaY > 0 ? 'scroll_down' : 'scroll_up';
-      sendTouchEvent(touchStartPos.x, touchStartPos.y, action);
-      touchStartPos.y = currentY;
+    applyAllSettings();
+}
+
+
+/* =========================================================
+   FORCE STREAM REFRESH
+========================================================= */
+
+async function forceRefresh() {
+
+    await api(
+        "/refresh",
+        {
+            method: "POST"
+        }
+    );
+}
+
+
+/* =========================================================
+   MOVABLE TOOL PANEL
+========================================================= */
+
+const toolPanel =
+    document.getElementById(
+        "toolPanel"
+    );
+
+const toolDrag =
+    document.getElementById(
+        "toolDrag"
+    );
+
+let draggingTool = false;
+
+let dragOffsetX = 0;
+
+let dragOffsetY = 0;
+
+
+toolDrag.addEventListener(
+    "pointerdown",
+    e => {
+
+        e.preventDefault();
+
+        draggingTool = true;
+
+        const rect =
+            toolPanel.getBoundingClientRect();
+
+        dragOffsetX =
+            e.clientX - rect.left;
+
+        dragOffsetY =
+            e.clientY - rect.top;
+
+        toolDrag.setPointerCapture(
+            e.pointerId
+        );
     }
-  });
+);
 
-  screenImg.addEventListener('touchend', (e) => {
-    if (touchTimer) {
-      clearTimeout(touchTimer);
-      const action = (currentMode === 'rightClick') ? 'right_click' : 'click';
-      sendTouchEvent(touchStartPos.x, touchStartPos.y, action);
-      if (currentMode === 'rightClick') toggleMode('normal');
+
+toolDrag.addEventListener(
+    "pointermove",
+    e => {
+
+        if (!draggingTool) {
+            return;
+        }
+
+        let left =
+            e.clientX - dragOffsetX;
+
+        let top =
+            e.clientY - dragOffsetY;
+
+
+        const maxLeft =
+            window.innerWidth
+            - toolPanel.offsetWidth
+            - 4;
+
+        const maxTop =
+            window.innerHeight
+            - toolPanel.offsetHeight
+            - 4;
+
+
+        left =
+            Math.max(
+                4,
+                Math.min(
+                    maxLeft,
+                    left
+                )
+            );
+
+        top =
+            Math.max(
+                4,
+                Math.min(
+                    maxTop,
+                    top
+                )
+            );
+
+
+        toolPanel.style.left =
+            left + "px";
+
+        toolPanel.style.top =
+            top + "px";
+
+        toolPanel.style.right =
+            "auto";
+
+        toolPanel.style.transform =
+            "none";
+
+        saveToolPosition();
     }
-  });
+);
 
-  async function sendTouchEvent(x, y, actionType) {
-    await fetch(`${API_BASE}/touch`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        x: x,
-        y: y,
-        action: actionType,
-        screen_width: window.innerWidth,
-        screen_height: window.innerHeight
-      })
-    });
-  }
 
-  kbInput.addEventListener('keydown', async (e) => {
-    if (e.key === 'Backspace' || e.key === 'Enter') {
-      await fetch(`${API_BASE}/key`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key: e.key })
-      });
+toolDrag.addEventListener(
+    "pointerup",
+    e => {
+
+        draggingTool = false;
+
+        try {
+            toolDrag.releasePointerCapture(
+                e.pointerId
+            );
+        } catch (_) {}
+
     }
-  });
+);
 
-  kbInput.addEventListener('input', async (e) => {
-    const val = e.target.value;
-    if (val.length > 0) {
-      const char = val.slice(-1);
-      await fetch(`${API_BASE}/key`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key: char })
-      });
-      e.target.value = '';
+
+function saveToolPosition() {
+
+    localStorage.setItem(
+        "remoteToolPosition",
+        JSON.stringify({
+            left: toolPanel.style.left,
+            top: toolPanel.style.top
+        })
+    );
+}
+
+
+function loadToolPosition() {
+
+    try {
+
+        const data =
+            JSON.parse(
+                localStorage.getItem(
+                    "remoteToolPosition"
+                )
+            );
+
+        if (!data) return;
+
+        if (data.left) {
+            toolPanel.style.left =
+                data.left;
+        }
+
+        if (data.top) {
+            toolPanel.style.top =
+                data.top;
+        }
+
+        toolPanel.style.right =
+            "auto";
+
+        toolPanel.style.transform =
+            "none";
+
+    } catch (e) {}
+}
+
+
+/* =========================================================
+   IMAGE LOAD
+========================================================= */
+
+screenImg.addEventListener(
+    "load",
+    () => {
+
+        document.getElementById(
+            "loading"
+        ).style.display =
+            "none";
+
+        updateDebug();
+
     }
-  });
+);
 
-  fetchTabs();
+
+screenImg.addEventListener(
+    "error",
+    () => {
+
+        document.getElementById(
+            "loading"
+        ).textContent =
+            "Stream reconnecting...";
+
+        document.getElementById(
+            "loading"
+        ).style.display =
+            "block";
+
+    }
+);
+
+
+/* =========================================================
+   INIT
+========================================================= */
+
+async function init() {
+
+    loadLocalSettings();
+
+    loadToolPosition();
+
+    updateSettingUI();
+
+    await fetchTabs();
+
+    await syncViewport();
+
+    updateStatus();
+
+    /*
+       Hide loading after a short period.
+    */
+
+    setTimeout(
+        () => {
+
+            document.getElementById(
+                "loading"
+            ).style.display =
+                "none";
+
+        },
+        2500
+    );
+}
+
+
+init();
+
 </script>
+
 </body>
 </html>
