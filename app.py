@@ -4,128 +4,105 @@ from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from typing import Optional, List
-import urllib.parse
+from collections import deque
 import asyncio
+import urllib.parse
 import os
-import math
+import time
+import json
+import traceback
 
-
-# ============================================================
-# APP
-# ============================================================
-
-app = FastAPI(title="Remote Browser Engine")
+app = FastAPI(title="Remote Chromium Browser")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 
-# ============================================================
-# GLOBAL BROWSER STATE
-# ============================================================
+DATA_DIR = os.getenv("BROWSER_DATA_DIR", "/app/user_data")
+MAX_TABS = int(os.getenv("MAX_TABS", "8"))
+
+stream_settings = {
+    "format": "png",          # png / jpeg / webp
+    "quality": 70,            # jpeg/webp quality
+    "interval": 180,          # target frame interval in ms
+    "width": 854,
+    "height": 480,
+    "max_pixels": 854 * 480,
+}
+
+# ------------------------------------------------------------
+# Global browser state
+# ------------------------------------------------------------
 
 playwright_instance = None
-browser = None
 context = None
-
 pages: List = []
 active_tab_index = 0
 
-
-# ============================================================
-# SCREEN / STREAM SETTINGS
-# ============================================================
-
-stream_settings = {
-    "format": "jpeg",
-    "quality": 35,
-
-    # Idle update interval in milliseconds.
-    # 1000 = 1 FPS
-    # 500  = 2 FPS
-    # 250  = 4 FPS
-    "interval": 700,
-
-    "width": 854,
-    "height": 480,
-
-    # Maximum screenshot pixel budget.
-    "max_pixels": 500000,
-}
-
-
-# Event used to immediately wake the stream after interaction.
-screen_event = asyncio.Event()
-
-# Prevent multiple Playwright operations from colliding.
 page_lock = asyncio.Lock()
-
-# Last generated frame.
+screen_event = asyncio.Event()
 last_frame = None
 
-# Frame sequence.
-frame_id = 0
+frame_times = deque(maxlen=240)
+last_encode_ms = 0.0
+last_frame_bytes = 0
+last_action = "startup"
 
+cpu_prev = None
+cpu_prev_time = None
 
-# ============================================================
-# VIEWPORT
-# ============================================================
+# ------------------------------------------------------------
+# Models
+# ------------------------------------------------------------
 
-current_viewport = {
-    "width": 854,
-    "height": 480
-}
+class NavigatePayload(BaseModel):
+    url: str
 
+class TouchPayload(BaseModel):
+    x: float
+    y: float
+    action: Optional[str] = "click"
+    delta_x: float = 0
+    delta_y: float = 0
 
-# ============================================================
-# HELPERS
-# ============================================================
+class KeyPayload(BaseModel):
+    key: str
 
-def mark_screen_dirty():
-    """
-    Tell the streaming system that the page changed.
-    """
-    try:
-        screen_event.set()
-    except Exception:
-        pass
+class TypePayload(BaseModel):
+    text: str
 
+class SettingsPayload(BaseModel):
+    format: Optional[str] = None
+    quality: Optional[int] = None
+    interval: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    max_pixels: Optional[int] = None
 
-def clamp(value, minimum, maximum):
-    return max(minimum, min(maximum, value))
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 
+def mark_screen_dirty(action="unknown"):
+    global last_action
+    last_action = action
+    screen_event.set()
 
-def calculate_viewport(width: int, height: int):
-    """
-    Keep viewport lightweight while preserving aspect ratio.
-    """
-
-    width = max(240, int(width))
-    height = max(180, int(height))
-
-    # Hard maximum dimensions.
-    max_width = 1200
-    max_height = 1000
-
-    width = min(width, max_width)
-    height = min(height, max_height)
-
-    max_pixels = int(stream_settings.get("max_pixels", 500000))
-
-    pixels = width * height
-
-    if pixels > max_pixels:
-        scale = math.sqrt(max_pixels / pixels)
-        width = max(240, int(width * scale))
-        height = max(180, int(height * scale))
-
-    return width, height
-
+async def get_active_page():
+    global pages, active_tab_index
+    if not pages:
+        return None
+    if active_tab_index >= len(pages):
+        active_tab_index = max(0, len(pages) - 1)
+    return pages[active_tab_index]
 
 def sanitize_url(raw_input: str) -> str:
     url = (raw_input or "").strip()
@@ -133,84 +110,216 @@ def sanitize_url(raw_input: str) -> str:
     if not url:
         return "https://www.google.com"
 
-    if url.startswith(("http://", "https://")):
+    if url.startswith(("http://", "https://", "about:")):
         return url
 
     if "." in url and " " not in url:
         return "https://" + url
 
-    return (
-        "https://www.google.com/search?q="
-        + urllib.parse.quote(url)
-    )
+    return "https://www.google.com/search?q=" + urllib.parse.quote(url)
 
+def clamp_int(value, minimum, maximum):
+    return max(minimum, min(maximum, int(value)))
 
-async def get_active_page():
-    if not pages:
+def current_viewport():
+    return {
+        "width": stream_settings["width"],
+        "height": stream_settings["height"],
+    }
+
+def cgroup_value(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
         return None
 
-    if active_tab_index >= len(pages):
-        return pages[-1]
+def get_memory_stats():
+    # Linux cgroup v2 first.
+    current = cgroup_value("/sys/fs/cgroup/memory.current")
+    maximum = cgroup_value("/sys/fs/cgroup/memory.max")
 
-    return pages[active_tab_index]
+    if current is not None:
+        try:
+            current_b = int(current)
+            if maximum and maximum != "max":
+                max_b = int(maximum)
+            else:
+                max_b = 0
+            return {
+                "used_mb": round(current_b / 1024 / 1024, 1),
+                "limit_mb": round(max_b / 1024 / 1024, 1) if max_b else None,
+            }
+        except Exception:
+            pass
 
+    # Fallback: /proc.
+    try:
+        info = {}
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1]) * 1024
 
-# ============================================================
-# STARTUP
-# ============================================================
+        total = info.get("MemTotal", 0)
+        available = info.get("MemAvailable", 0)
+        used = max(0, total - available)
+
+        return {
+            "used_mb": round(used / 1024 / 1024, 1),
+            "limit_mb": round(total / 1024 / 1024, 1) if total else None,
+        }
+    except Exception:
+        return {"used_mb": None, "limit_mb": None}
+
+def get_cgroup_cpu_percent():
+    global cpu_prev, cpu_prev_time
+
+    stat = cgroup_value("/sys/fs/cgroup/cpu.stat")
+    if not stat:
+        return None
+
+    usage_usec = None
+    for line in stat.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "usage_usec":
+            usage_usec = int(parts[1])
+            break
+
+    if usage_usec is None:
+        return None
+
+    now = time.monotonic()
+
+    if cpu_prev is None:
+        cpu_prev = usage_usec
+        cpu_prev_time = now
+        return 0.0
+
+    elapsed = now - cpu_prev_time
+    delta_cpu = (usage_usec - cpu_prev) / 1_000_000
+
+    cpu_prev = usage_usec
+    cpu_prev_time = now
+
+    if elapsed <= 0:
+        return 0.0
+
+    # 100% means one full CPU core.
+    return round(max(0.0, min(999.0, (delta_cpu / elapsed) * 100)), 1)
+
+def get_process_memory():
+    try:
+        with open("/proc/self/statm", "r", encoding="utf-8") as f:
+            pages = int(f.read().split()[1])
+        return round(pages * os.sysconf("SC_PAGE_SIZE") / 1024 / 1024, 1)
+    except Exception:
+        return None
+
+async def browser_memory_estimate():
+    # Add RSS of Chromium processes when /proc is available.
+    total = 0.0
+
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+
+            cmd_path = f"/proc/{name}/cmdline"
+            statm_path = f"/proc/{name}/statm"
+
+            try:
+                with open(cmd_path, "rb") as f:
+                    cmd = f.read().decode("utf-8", "ignore").lower()
+
+                if "chrom" not in cmd:
+                    continue
+
+                with open(statm_path, "r", encoding="utf-8") as f:
+                    rss_pages = int(f.read().split()[1])
+
+                total += rss_pages * os.sysconf("SC_PAGE_SIZE") / 1024 / 1024
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return round(total, 1)
+
+async def build_stats():
+    now = time.monotonic()
+
+    # Server stream FPS over the latest ~2 seconds.
+    recent = [t for t in frame_times if now - t <= 2.0]
+    if len(recent) >= 2:
+        span = max(0.001, recent[-1] - recent[0])
+        fps = round((len(recent) - 1) / span, 1)
+    else:
+        fps = 0.0
+
+    mem = get_memory_stats()
+    browser_mem = await browser_memory_estimate()
+    cpu = get_cgroup_cpu_percent()
+
+    return {
+        "server_fps": fps,
+        "frame_bytes": last_frame_bytes,
+        "frame_kb": round(last_frame_bytes / 1024, 1),
+        "encode_ms": round(last_encode_ms, 1),
+        "ram_mb": mem["used_mb"],
+        "ram_limit_mb": mem["limit_mb"],
+        "python_ram_mb": get_process_memory(),
+        "chromium_ram_mb": browser_mem,
+        "cpu_percent": cpu,
+        "tabs": len(pages),
+        "active_tab": active_tab_index,
+        "viewport": current_viewport(),
+        "format": stream_settings["format"],
+        "quality": stream_settings["quality"],
+        "interval": stream_settings["interval"],
+        "last_action": last_action,
+        "storage_path": DATA_DIR,
+    }
+
+# ------------------------------------------------------------
+# Startup / shutdown
+# ------------------------------------------------------------
 
 @app.on_event("startup")
 async def startup_event():
+    global playwright_instance, context, pages, active_tab_index
 
-    global playwright_instance
-    global browser
-    global context
-    global pages
-    global active_tab_index
-    global current_viewport
+    os.makedirs(DATA_DIR, exist_ok=True)
 
     playwright_instance = await async_playwright().start()
 
-    browser = await playwright_instance.chromium.launch(
+    # Persistent Chromium profile.
+    # Cookies/localStorage/session data are stored here.
+    context = await playwright_instance.chromium.launch_persistent_context(
+        user_data_dir=DATA_DIR,
         headless=True,
+        viewport=current_viewport(),
+        device_scale_factor=1,
+        is_mobile=False,
+        has_touch=False,
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
-
-            # Reduce unnecessary background work.
+            "--disable-blink-features=AutomationControlled",
             "--disable-background-networking",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-breakpad",
-            "--disable-component-update",
-            "--disable-default-apps",
-            "--disable-extensions",
-            "--disable-sync",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-features=Translate,MediaRouter",
             "--no-first-run",
             "--no-default-browser-check",
-        ]
-    )
-
-    current_viewport["width"] = stream_settings["width"]
-    current_viewport["height"] = stream_settings["height"]
-
-    context = await browser.new_context(
-        viewport={
-            "width": current_viewport["width"],
-            "height": current_viewport["height"]
-        },
-
-        device_scale_factor=1,
-
-        is_mobile=False,
-        has_touch=False,
-
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        )
+        ],
     )
 
     await context.add_init_script("""
@@ -219,53 +328,40 @@ async def startup_event():
         });
     """)
 
-    initial_page = await context.new_page()
+    pages = context.pages
 
-    try:
-        await initial_page.goto(
-            "https://www.google.com",
-            wait_until="domcontentloaded",
-            timeout=15000
-        )
-    except Exception:
-        pass
+    if not pages:
+        initial_page = await context.new_page()
+        try:
+            await initial_page.goto(
+                "https://www.google.com",
+                wait_until="commit",
+                timeout=15000
+            )
+        except Exception:
+            pass
+        pages.append(initial_page)
 
-    pages.append(initial_page)
     active_tab_index = 0
-
-    mark_screen_dirty()
-
-
-# ============================================================
-# SHUTDOWN
-# ============================================================
+    mark_screen_dirty("startup")
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    global playwright_instance, context
 
-    global browser
-    global playwright_instance
-
-    if browser:
-        try:
-            await browser.close()
-        except Exception:
-            pass
-
-    if playwright_instance:
-        try:
+    try:
+        if context:
+            await context.close()
+    finally:
+        if playwright_instance:
             await playwright_instance.stop()
-        except Exception:
-            pass
 
-
-# ============================================================
-# FRONTEND
-# ============================================================
+# ------------------------------------------------------------
+# Basic routes
+# ------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
-
     base_dir = os.path.dirname(os.path.abspath(__file__))
     html_path = os.path.join(base_dir, "index.html")
 
@@ -277,127 +373,163 @@ async def read_root():
         status_code=404
     )
 
+@app.get("/health")
+async def health():
+    return {
+        "status": "online",
+        "browser": "chromium",
+        "tabs": len(pages),
+        "persistent_profile": True,
+        "storage_path": DATA_DIR,
+    }
 
-# ============================================================
-# SCREENSHOT ENGINE
-# ============================================================
+@app.get("/settings")
+async def get_settings():
+    return {
+        "settings": stream_settings,
+        "viewport": current_viewport(),
+    }
 
-async def make_screenshot():
+@app.post("/settings")
+async def update_settings(payload: SettingsPayload):
+    allowed_formats = {"png", "jpeg", "webp"}
 
-    global last_frame
-    global frame_id
+    if payload.format is not None:
+        fmt = payload.format.lower()
+        if fmt in allowed_formats:
+            stream_settings["format"] = fmt
 
-    page = await get_active_page()
+    if payload.quality is not None:
+        stream_settings["quality"] = clamp_int(payload.quality, 10, 100)
 
-    if not page:
+    if payload.interval is not None:
+        stream_settings["interval"] = clamp_int(payload.interval, 30, 2000)
+
+    if payload.width is not None:
+        stream_settings["width"] = clamp_int(payload.width, 320, 1280)
+
+    if payload.height is not None:
+        stream_settings["height"] = clamp_int(payload.height, 240, 900)
+
+    if payload.max_pixels is not None:
+        stream_settings["max_pixels"] = clamp_int(
+            payload.max_pixels, 100000, 2_000_000
+        )
+
+    if context:
+        try:
+            await context.set_viewport_size(
+                {
+                    "width": stream_settings["width"],
+                    "height": stream_settings["height"],
+                }
+            )
+        except Exception:
+            pass
+
+    mark_screen_dirty("settings")
+
+    return {
+        "status": "success",
+        "settings": stream_settings,
+        "viewport": current_viewport(),
+    }
+
+# ------------------------------------------------------------
+# Screen streaming
+# ------------------------------------------------------------
+
+async def capture_frame(page):
+    global last_frame, last_encode_ms, last_frame_bytes
+
+    fmt = stream_settings["format"]
+    quality = stream_settings["quality"]
+
+    started = time.perf_counter()
+
+    try:
+        # Do not disable animations here. That can make live pages/videos
+        # behave strangely and was a source of bad visual behavior.
+        if fmt == "jpeg":
+            data = await page.screenshot(
+                type="jpeg",
+                quality=quality,
+                animations="allow",
+                scale="css",
+            )
+        elif fmt == "webp":
+            # Chromium/Playwright versions differ on WebP screenshot support.
+            # Try WebP first; fall back to PNG if unsupported.
+            try:
+                data = await page.screenshot(
+                    type="webp",
+                    quality=quality,
+                    animations="allow",
+                    scale="css",
+                )
+            except Exception:
+                data = await page.screenshot(
+                    type="png",
+                    animations="allow",
+                    scale="css",
+                )
+        else:
+            data = await page.screenshot(
+                type="png",
+                animations="allow",
+                scale="css",
+            )
+
+        last_encode_ms = (time.perf_counter() - started) * 1000
+        last_frame_bytes = len(data)
+        last_frame = data
+        frame_times.append(time.monotonic())
+
+        return data
+
+    except Exception:
         return None
 
-    async with page_lock:
-
-        try:
-
-            if stream_settings["format"] == "png":
-
-                image = await page.screenshot(
-                    type="png",
-                    animations="disabled",
-                    scale="css"
-                )
-
-            else:
-
-                quality = int(
-                    clamp(
-                        stream_settings.get("quality", 35),
-                        10,
-                        80
-                    )
-                )
-
-                image = await page.screenshot(
-                    type="jpeg",
-                    quality=quality,
-                    animations="disabled",
-                    scale="css"
-                )
-
-            last_frame = image
-            frame_id += 1
-
-            return image
-
-        except Exception:
-            return last_frame
-
-
 async def frame_generator():
-
     global last_frame
 
-    # Always send an initial frame.
-    image = await make_screenshot()
-
-    if image:
-        content_type = (
-            "image/png"
-            if stream_settings["format"] == "png"
-            else "image/jpeg"
-        )
-
-        yield (
-            b"--frame\r\n"
-            + f"Content-Type: {content_type}\r\n\r\n".encode()
-            + image
-            + b"\r\n"
-        )
-
     while True:
+        page = await get_active_page()
 
-        interval = int(
-            clamp(
-                stream_settings.get("interval", 700),
-                100,
-                5000
-            )
-        )
+        if page:
+            try:
+                data = await capture_frame(page)
 
-        # Wait for either:
-        # 1. user interaction / page change
-        # 2. idle timer
+                if data:
+                    content_type = {
+                        "png": "image/png",
+                        "jpeg": "image/jpeg",
+                        "webp": "image/webp",
+                    }.get(stream_settings["format"], "image/png")
+
+                    yield (
+                        b"--frame\r\n"
+                        + f"Content-Type: {content_type}\r\n".encode()
+                        + f"Content-Length: {len(data)}\r\n\r\n".encode()
+                        + data
+                        + b"\r\n"
+                    )
+            except Exception:
+                pass
+
+        # Wake immediately after user interaction/settings, otherwise
+        # respect the selected stream interval.
         try:
             await asyncio.wait_for(
                 screen_event.wait(),
-                timeout=interval / 1000
+                timeout=max(0.03, stream_settings["interval"] / 1000)
             )
+            screen_event.clear()
         except asyncio.TimeoutError:
             pass
 
-        # Clear BEFORE screenshot.
-        # If an action happens while screenshotting,
-        # the Event will become set again.
-        screen_event.clear()
-
-        image = await make_screenshot()
-
-        if image:
-
-            content_type = (
-                "image/png"
-                if stream_settings["format"] == "png"
-                else "image/jpeg"
-            )
-
-            yield (
-                b"--frame\r\n"
-                + f"Content-Type: {content_type}\r\n\r\n".encode()
-                + image
-                + b"\r\n"
-            )
-
-
 @app.get("/screen")
 async def stream_screen():
-
     return StreamingResponse(
         frame_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
@@ -405,577 +537,454 @@ async def stream_screen():
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
             "Connection": "keep-alive",
+        },
+    )
+
+# ------------------------------------------------------------
+# Navigation
+# ------------------------------------------------------------
+
+@app.post("/navigate")
+async def navigate(payload: NavigatePayload):
+    page = await get_active_page()
+
+    if not page:
+        return {"status": "error", "message": "No active page"}
+
+    target_url = sanitize_url(payload.url)
+
+    try:
+        async with page_lock:
+            await page.goto(
+                target_url,
+                wait_until="commit",
+                timeout=20000
+            )
+
+        mark_screen_dirty("navigate")
+
+        return {
+            "status": "success",
+            "url": page.url,
         }
-    )
 
+    except Exception as e:
+        mark_screen_dirty("navigate-error")
+        return {
+            "status": "error",
+            "message": str(e),
+            "url": page.url,
+        }
 
-# ============================================================
-# MODELS
-# ============================================================
+@app.post("/history/back")
+async def history_back():
+    page = await get_active_page()
 
-class NavigatePayload(BaseModel):
-    url: str
+    if not page:
+        return {"status": "error"}
 
-
-class TouchPayload(BaseModel):
-    x: float
-    y: float
-
-    action: Optional[str] = "click"
-
-
-class KeyPayload(BaseModel):
-    key: str
-
-
-class ViewportPayload(BaseModel):
-    width: int
-    height: int
-
-
-class StreamSettingsPayload(BaseModel):
-    format: Optional[str] = None
-    quality: Optional[int] = None
-    interval: Optional[int] = None
-    width: Optional[int] = None
-    height: Optional[int] = None
-    max_pixels: Optional[int] = None
-
-
-# ============================================================
-# SETTINGS API
-# ============================================================
-
-@app.get("/settings")
-async def get_settings():
-
-    return {
-        "stream": stream_settings,
-        "viewport": current_viewport
-    }
-
-
-@app.post("/settings")
-async def update_settings(
-    payload: StreamSettingsPayload
-):
-
-    global stream_settings
-
-    data = payload.model_dump(exclude_none=True)
-
-    if "format" in data:
-        if data["format"] not in ("jpeg", "png"):
-            data["format"] = "jpeg"
-
-    if "quality" in data:
-        data["quality"] = int(
-            clamp(data["quality"], 10, 80)
-        )
-
-    if "interval" in data:
-        data["interval"] = int(
-            clamp(data["interval"], 100, 5000)
-        )
-
-    if "max_pixels" in data:
-        data["max_pixels"] = int(
-            clamp(data["max_pixels"], 100000, 1000000)
-        )
-
-    for key in (
-        "format",
-        "quality",
-        "interval",
-        "max_pixels"
-    ):
-        if key in data:
-            stream_settings[key] = data[key]
-
-    if "width" in data or "height" in data:
-
-        width = int(
-            data.get(
-                "width",
-                current_viewport["width"]
+    try:
+        async with page_lock:
+            await page.go_back(
+                wait_until="commit",
+                timeout=10000
             )
-        )
 
-        height = int(
-            data.get(
-                "height",
-                current_viewport["height"]
+        mark_screen_dirty("back")
+        return {"status": "success", "url": page.url}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e), "url": page.url}
+
+@app.post("/history/forward")
+async def history_forward():
+    page = await get_active_page()
+
+    if not page:
+        return {"status": "error"}
+
+    try:
+        async with page_lock:
+            await page.go_forward(
+                wait_until="commit",
+                timeout=10000
             )
-        )
 
-        width, height = calculate_viewport(
-            width,
-            height
-        )
+        mark_screen_dirty("forward")
+        return {"status": "success", "url": page.url}
 
-        stream_settings["width"] = width
-        stream_settings["height"] = height
+    except Exception as e:
+        return {"status": "error", "message": str(e), "url": page.url}
 
-        await set_browser_viewport(width, height)
+@app.post("/reload")
+async def reload_page():
+    page = await get_active_page()
 
-    mark_screen_dirty()
+    if not page:
+        return {"status": "error"}
 
-    return {
-        "status": "success",
-        "stream": stream_settings,
-        "viewport": current_viewport
-    }
+    try:
+        async with page_lock:
+            await page.reload(
+                wait_until="commit",
+                timeout=15000
+            )
 
+        mark_screen_dirty("reload")
+        return {"status": "success", "url": page.url}
 
-# ============================================================
-# VIEWPORT API
-# ============================================================
+    except Exception as e:
+        return {"status": "error", "message": str(e), "url": page.url}
 
-async def set_browser_viewport(width, height):
+@app.post("/stop")
+async def stop_page():
+    page = await get_active_page()
 
-    global current_viewport
+    if not page:
+        return {"status": "error"}
 
-    width, height = calculate_viewport(
-        width,
-        height
-    )
+    try:
+        await page.evaluate("window.stop()")
+        mark_screen_dirty("stop")
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-    async with page_lock:
+@app.post("/home")
+async def home():
+    return await navigate(NavigatePayload(url="https://www.google.com"))
 
-        if context:
-
-            try:
-                await context.set_viewport_size({
-                    "width": width,
-                    "height": height
-                })
-
-                current_viewport["width"] = width
-                current_viewport["height"] = height
-
-            except Exception:
-                pass
-
-    return current_viewport
-
-
-@app.post("/viewport")
-async def update_viewport(
-    payload: ViewportPayload
-):
-
-    width, height = calculate_viewport(
-        payload.width,
-        payload.height
-    )
-
-    await set_browser_viewport(
-        width,
-        height
-    )
-
-    stream_settings["width"] = current_viewport["width"]
-    stream_settings["height"] = current_viewport["height"]
-
-    mark_screen_dirty()
-
-    return {
-        "status": "success",
-        "width": current_viewport["width"],
-        "height": current_viewport["height"]
-    }
-
-
-@app.get("/viewport")
-async def get_viewport():
-
-    return current_viewport
-
-
-# ============================================================
-# TABS
-# ============================================================
+# ------------------------------------------------------------
+# Tabs
+# ------------------------------------------------------------
 
 @app.get("/tabs")
 async def get_tabs():
-
-    global pages
-    global active_tab_index
+    global pages, active_tab_index
 
     tabs_data = []
 
-    for idx, page in enumerate(pages):
-
+    for idx, p in enumerate(pages):
         try:
-
-            title = await page.title()
+            title = await p.title()
+            url = p.url
 
             tabs_data.append({
                 "id": idx,
                 "title": title or "New Tab",
-                "url": page.url
+                "url": url,
             })
 
         except Exception:
-
             tabs_data.append({
                 "id": idx,
                 "title": "New Tab",
-                "url": "about:blank"
+                "url": "about:blank",
             })
 
     return {
         "tabs": tabs_data,
-        "active_index": active_tab_index
+        "active_index": active_tab_index,
     }
-
 
 @app.post("/tabs/new")
 async def new_tab():
+    global pages, active_tab_index
 
-    global active_tab_index
+    if len(pages) >= MAX_TABS:
+        return {
+            "status": "error",
+            "message": f"Maximum {MAX_TABS} tabs allowed"
+        }
 
-    async with page_lock:
-
+    try:
+        # Do not wait for Google to finish loading.
+        # This makes the new-tab action much faster.
         new_page = await context.new_page()
-
-        try:
-            await new_page.goto(
-                "https://www.google.com",
-                wait_until="commit",
-                timeout=10000
-            )
-        except Exception:
-            pass
-
         pages.append(new_page)
-
         active_tab_index = len(pages) - 1
 
-    mark_screen_dirty()
+        asyncio.create_task(
+            background_open_home(new_page)
+        )
 
-    return await get_tabs()
+        mark_screen_dirty("new-tab")
+        return await get_tabs()
 
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+async def background_open_home(page):
+    try:
+        await page.goto(
+            "https://www.google.com",
+            wait_until="commit",
+            timeout=15000
+        )
+    except Exception:
+        pass
+    mark_screen_dirty("new-tab-loaded")
 
 @app.post("/tabs/switch")
 async def switch_tab(payload: dict):
-
-    global active_tab_index
+    global active_tab_index, pages
 
     idx = int(payload.get("index", 0))
 
     if 0 <= idx < len(pages):
         active_tab_index = idx
 
-    mark_screen_dirty()
+        try:
+            await pages[idx].bring_to_front()
+        except Exception:
+            pass
+
+        mark_screen_dirty("switch-tab")
 
     return await get_tabs()
-
 
 @app.post("/tabs/close")
 async def close_tab(payload: dict):
-
-    global active_tab_index
+    global pages, active_tab_index
 
     idx = int(payload.get("index", 0))
 
-    if len(pages) > 1 and 0 <= idx < len(pages):
+    if len(pages) <= 1:
+        return await get_tabs()
 
-        async with page_lock:
+    if 0 <= idx < len(pages):
+        p = pages.pop(idx)
 
-            page = pages.pop(idx)
+        try:
+            await p.close()
+        except Exception:
+            pass
 
-            try:
-                await page.close()
-            except Exception:
-                pass
+        if idx < active_tab_index:
+            active_tab_index -= 1
+        elif active_tab_index >= len(pages):
+            active_tab_index = len(pages) - 1
 
-            if active_tab_index >= len(pages):
-                active_tab_index = len(pages) - 1
-
-            elif idx < active_tab_index:
-                active_tab_index -= 1
-
-    mark_screen_dirty()
+        mark_screen_dirty("close-tab")
 
     return await get_tabs()
 
-
-# ============================================================
-# NAVIGATION
-# ============================================================
-
-@app.post("/navigate")
-async def navigate(payload: NavigatePayload):
-
-    global active_tab_index
-
-    target_url = sanitize_url(payload.url)
-
-    page = await get_active_page()
-
-    if not page:
-        return {
-            "status": "error",
-            "message": "No active page"
-        }
-
-    try:
-
-        async with page_lock:
-
-            # Commit is intentionally used instead of waiting
-            # for the whole page to finish.
-            await page.goto(
-                target_url,
-                wait_until="commit",
-                timeout=12000
-            )
-
-        mark_screen_dirty()
-
-        # Ask browser to update again when DOM is ready.
-        async def later_update():
-
-            try:
-
-                await page.wait_for_load_state(
-                    "domcontentloaded",
-                    timeout=10000
-                )
-
-            except Exception:
-                pass
-
-            mark_screen_dirty()
-
-        asyncio.create_task(later_update())
-
-        return {
-            "status": "success",
-            "url": page.url
-        }
-
-    except Exception as e:
-
-        mark_screen_dirty()
-
-        return {
-            "status": "error",
-            "message": str(e),
-            "url": page.url
-        }
-
-
-# ============================================================
-# TOUCH / MOUSE
-# ============================================================
+# ------------------------------------------------------------
+# Touch / mouse
+# ------------------------------------------------------------
 
 @app.post("/touch")
-async def handle_touch(
-    payload: TouchPayload
-):
-
+async def handle_touch(payload: TouchPayload):
     page = await get_active_page()
 
     if not page:
-        return {
-            "status": "error",
-            "message": "No active page"
-        }
-
-    x = float(payload.x)
-    y = float(payload.y)
-
-    width = current_viewport["width"]
-    height = current_viewport["height"]
-
-    # Absolute safety clamp.
-    x = clamp(x, 0, width - 1)
-    y = clamp(y, 0, height - 1)
-
-    action = payload.action or "click"
+        return {"status": "error"}
 
     try:
+        vw = stream_settings["width"]
+        vh = stream_settings["height"]
+
+        x = max(0, min(float(payload.x), vw - 1))
+        y = max(0, min(float(payload.y), vh - 1))
 
         async with page_lock:
+            if payload.action == "click":
+                await page.mouse.click(x, y, delay=30)
 
-            await page.mouse.move(x, y)
-
-            if action == "click":
-
+            elif payload.action == "right_click":
                 await page.mouse.click(
-                    x,
-                    y,
-                    delay=30
-                )
-
-            elif action == "right_click":
-
-                await page.mouse.click(
-                    x,
-                    y,
+                    x, y,
                     button="right",
                     delay=30
                 )
 
-            elif action == "double_click":
-
+            elif payload.action == "double_click":
                 await page.mouse.dblclick(
-                    x,
-                    y,
+                    x, y,
                     delay=30
                 )
 
-            elif action == "middle_click":
+            elif payload.action == "scroll":
+                dx = max(-1200, min(1200, payload.delta_x))
+                dy = max(-1600, min(1600, payload.delta_y))
+                await page.mouse.wheel(dx, dy)
 
-                await page.mouse.click(
-                    x,
-                    y,
-                    button="middle",
-                    delay=30
-                )
+            elif payload.action == "move":
+                await page.mouse.move(x, y)
 
-            elif action == "scroll_down":
+        mark_screen_dirty(payload.action or "touch")
 
-                await page.mouse.wheel(
-                    0,
-                    350
-                )
-
-            elif action == "scroll_up":
-
-                await page.mouse.wheel(
-                    0,
-                    -350
-                )
-
-            elif action == "scroll_left":
-
-                await page.mouse.wheel(
-                    -350,
-                    0
-                )
-
-            elif action == "scroll_right":
-
-                await page.mouse.wheel(
-                    350,
-                    0
-                )
-
-        mark_screen_dirty()
-
-        return {
-            "status": "success",
-            "x": x,
-            "y": y,
-            "action": action
-        }
+        return {"status": "success"}
 
     except Exception as e:
-
         return {
             "status": "error",
-            "message": str(e)
+            "message": str(e),
         }
 
+# ------------------------------------------------------------
+# Exact text input
+# ------------------------------------------------------------
 
-# ============================================================
-# KEYBOARD
-# ============================================================
-
-@app.post("/key")
-async def handle_key(
-    payload: KeyPayload
-):
-
+@app.post("/type")
+async def type_text(payload: TypePayload):
     page = await get_active_page()
 
     if not page:
-        return {
-            "status": "error"
-        }
-
-    key = payload.key or ""
+        return {"status": "error"}
 
     try:
+        # insert_text sends the whole string as text instead of generating
+        # one HTTP request per character. This prevents fast typing loss.
+        await page.keyboard.insert_text(payload.text)
 
-        async with page_lock:
-
-            if key in (
-                "Backspace",
-                "Enter",
-                "Tab",
-                "Escape",
-                "ArrowUp",
-                "ArrowDown",
-                "ArrowLeft",
-                "ArrowRight",
-                "Delete",
-                "Home",
-                "End",
-                "PageUp",
-                "PageDown",
-                "Space"
-            ):
-
-                actual_key = (
-                    " "
-                    if key == "Space"
-                    else key
-                )
-
-                await page.keyboard.press(
-                    actual_key
-                )
-
-            else:
-
-                await page.keyboard.type(
-                    key
-                )
-
-        mark_screen_dirty()
+        mark_screen_dirty("type")
 
         return {
-            "status": "success"
+            "status": "success",
+            "length": len(payload.text),
         }
 
     except Exception as e:
-
         return {
             "status": "error",
-            "message": str(e)
+            "message": str(e),
         }
 
+@app.post("/key")
+async def handle_key(payload: KeyPayload):
+    page = await get_active_page()
 
-# ============================================================
-# FORCE REFRESH FRAME
-# ============================================================
+    if not page:
+        return {"status": "error"}
 
-@app.post("/refresh")
-async def force_refresh():
+    try:
+        key = payload.key
 
-    mark_screen_dirty()
+        # Playwright key names.
+        aliases = {
+            "Backspace": "Backspace",
+            "Enter": "Enter",
+            "Tab": "Tab",
+            "Escape": "Escape",
+            "Delete": "Delete",
+            "ArrowLeft": "ArrowLeft",
+            "ArrowRight": "ArrowRight",
+            "ArrowUp": "ArrowUp",
+            "ArrowDown": "ArrowDown",
+            "Home": "Home",
+            "End": "End",
+        }
 
-    return {
-        "status": "success"
+        await page.keyboard.press(
+            aliases.get(key, key)
+        )
+
+        mark_screen_dirty("key")
+
+        return {"status": "success"}
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+        }
+
+# ------------------------------------------------------------
+# Device clipboard bridge
+# ------------------------------------------------------------
+
+async def selected_text_from_page(page):
+    return await page.evaluate("""
+    () => {
+        const el = document.activeElement;
+
+        if (
+            el &&
+            typeof el.selectionStart === "number" &&
+            typeof el.selectionEnd === "number"
+        ) {
+            return String(el.value || "").substring(
+                el.selectionStart,
+                el.selectionEnd
+            );
+        }
+
+        const sel = window.getSelection();
+        return sel ? sel.toString() : "";
     }
+    """)
 
+@app.get("/selection")
+async def get_selection():
+    page = await get_active_page()
 
-# ============================================================
-# HEALTH
-# ============================================================
+    if not page:
+        return {"status": "error", "text": ""}
 
-@app.get("/health")
-async def health():
+    try:
+        text = await selected_text_from_page(page)
+        return {"status": "success", "text": text}
+    except Exception as e:
+        return {"status": "error", "text": "", "message": str(e)}
+
+@app.post("/cut")
+async def cut_selection():
+    page = await get_active_page()
+
+    if not page:
+        return {"status": "error", "text": ""}
+
+    try:
+        text = await selected_text_from_page(page)
+
+        async with page_lock:
+            await page.keyboard.press("Control+X")
+
+        mark_screen_dirty("cut")
+
+        return {
+            "status": "success",
+            "text": text,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "text": "",
+            "message": str(e),
+        }
+
+# ------------------------------------------------------------
+# Diagnostics
+# ------------------------------------------------------------
+
+@app.get("/stats")
+async def stats():
+    return await build_stats()
+
+@app.get("/storage")
+async def storage():
+    total_size = 0
+    file_count = 0
+
+    try:
+        for root, dirs, files in os.walk(DATA_DIR):
+            for name in files:
+                try:
+                    total_size += os.path.getsize(
+                        os.path.join(root, name)
+                    )
+                    file_count += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     return {
-        "status": "online",
-        "browser": browser is not None,
-        "pages": len(pages),
-        "active_tab": active_tab_index,
-        "viewport": current_viewport,
-        "stream": stream_settings
+        "path": DATA_DIR,
+        "exists": os.path.exists(DATA_DIR),
+        "files": file_count,
+        "size_mb": round(total_size / 1024 / 1024, 2),
+        "persistent_profile": True,
     }
