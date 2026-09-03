@@ -223,8 +223,10 @@ async def restore_profile():
 async def startup_event():
     global playwright_instance
     os.makedirs(DATA_DIR,exist_ok=True)
-    playwright_instance=await async_playwright().start();await start_browser_context()
-    if AUTO_BACKUP_MINUTES>0:asyncio.create_task(auto_backup_loop())
+    playwright_instance=await async_playwright().start()
+    await start_browser_context()
+    if AUTO_BACKUP_MINUTES>0:
+        asyncio.create_task(auto_backup_loop())
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -437,21 +439,3 @@ async def restore():
 @app.get("/stats")
 async def stats():
     return await build_stats()
-
-async def auto_backup_loop():
-    if AUTO_BACKUP_MINUTES <= 0: return
-    await asyncio.sleep(120)
-    while True:
-        try:
-            if backup_status["configured"] and not backup_status["busy"]:
-                await asyncio.get_running_loop().run_in_executor(None, backup_worker)
-        except Exception: pass
-        await asyncio.sleep(max(60, AUTO_BACKUP_MINUTES * 60))
-
-_original_startup = startup_event
-async def startup_event_with_backup():
-    await _original_startup()
-    if AUTO_BACKUP_MINUTES > 0: asyncio.create_task(auto_backup_loop())
-try: app.router.on_startup.remove(_original_startup)
-except ValueError: pass
-app.router.on_startup.append(startup_event_with_backup)
