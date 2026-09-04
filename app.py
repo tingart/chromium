@@ -1,11 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from typing import Optional, List
 from collections import deque
-import asyncio, urllib.parse, urllib.error, os, time, json, tarfile, tempfile, shutil, urllib.request
+import asyncio, urllib.parse, urllib.error, os, time, json, tarfile, tempfile, shutil, urllib.request, secrets, hashlib, hmac, base64, threading
 
 app = FastAPI(title="Remote Chromium Browser")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -16,9 +16,13 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "browser-backup")
 SUPABASE_BACKUP_PATH = os.getenv("SUPABASE_BACKUP_PATH", "chromium-profile.tar.gz")
-AUTO_BACKUP_MINUTES = max(0, int(os.getenv("AUTO_BACKUP_MINUTES", "15")))
+AUTO_BACKUP_MINUTES = max(1, int(os.getenv("AUTO_BACKUP_MINUTES", "15")))
+AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "")
+AUTH_SECRET = os.getenv("AUTH_SECRET", "")
+SESSION_DAYS = max(1, int(os.getenv("SESSION_DAYS", "7")))
 
-stream_settings = {"format":"png","quality":70,"interval":180,"width":854,"height":480,"max_pixels":854*480}
+stream_settings = {"format":"png","quality":70,"interval":180,"width":854,"height":480,"max_pixels":854*480,"chromium_zoom":1.0}
 playwright_instance = None
 context = None
 pages: List = []
@@ -31,8 +35,8 @@ last_encode_ms = 0.0
 last_frame_bytes = 0
 last_action = "startup"
 cpu_prev = cpu_prev_time = None
-backup_lock = asyncio.Lock()
-backup_status = {"configured":bool(SUPABASE_URL and SUPABASE_SECRET_KEY),"busy":False,"last_backup":None,"last_restore":None,"last_error":None,"size_mb":None}
+backup_lock = threading.Lock()
+backup_status = {"configured":bool(SUPABASE_URL and SUPABASE_SECRET_KEY),"busy":False,"last_backup":None,"last_restore":None,"last_error":None,"size_mb":None,"cloud_backup_exists":None}
 
 class NavigatePayload(BaseModel): url: str
 class TouchPayload(BaseModel):
@@ -42,6 +46,61 @@ class TypePayload(BaseModel): text: str
 class SettingsPayload(BaseModel):
     format: Optional[str]=None; quality: Optional[int]=None; interval: Optional[int]=None
     width: Optional[int]=None; height: Optional[int]=None; max_pixels: Optional[int]=None
+    chromium_zoom: Optional[float]=None
+class LoginPayload(BaseModel): username: str; password: str
+
+# ---------- Login/session protection ----------
+def auth_configured():
+    return bool(AUTH_USERNAME and AUTH_PASSWORD and AUTH_SECRET)
+
+def make_session():
+    ts = str(int(time.time()))
+    nonce = secrets.token_urlsafe(24)
+    raw = ts + "." + nonce
+    sig = hmac.new(AUTH_SECRET.encode(), raw.encode(), hashlib.sha256).digest()
+    return raw + "." + base64.urlsafe_b64encode(sig).decode().rstrip("=")
+
+def valid_session(token):
+    if not token or not auth_configured(): return False
+    try:
+        ts, nonce, sig = token.split(".", 2)
+        if abs(int(time.time()) - int(ts)) > SESSION_DAYS*86400: return False
+        raw = ts + "." + nonce
+        expected = base64.urlsafe_b64encode(hmac.new(AUTH_SECRET.encode(), raw.encode(), hashlib.sha256).digest()).decode().rstrip("=")
+        return hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
+
+@app.middleware("http")
+async def authentication_middleware(request: Request, call_next):
+    path = request.url.path
+    public = path in {"/", "/login", "/logout", "/auth/status", "/favicon.ico"}
+    if not public and not valid_session(request.cookies.get("remote_session")):
+        if path == "/":
+            return FileResponse(os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html"))
+        if path.startswith("/api/") or path not in {"/"}:
+            return JSONResponse({"status":"error","message":"Authentication required"}, status_code=401)
+    return await call_next(request)
+
+@app.post("/login")
+async def login(payload: LoginPayload):
+    if not auth_configured():
+        return JSONResponse({"status":"error","message":"Authentication is not configured. Set AUTH_USERNAME, AUTH_PASSWORD and AUTH_SECRET in Render."}, status_code=500)
+    if not (hmac.compare_digest(payload.username, AUTH_USERNAME) and hmac.compare_digest(payload.password, AUTH_PASSWORD)):
+        return JSONResponse({"status":"error","message":"Invalid username or password"}, status_code=401)
+    response = JSONResponse({"status":"success"})
+    response.set_cookie("remote_session", make_session(), max_age=SESSION_DAYS*86400, httponly=True, secure=True, samesite="lax", path="/")
+    return response
+
+@app.post("/logout")
+async def logout():
+    response = JSONResponse({"status":"success"})
+    response.delete_cookie("remote_session", path="/")
+    return response
+
+@app.get("/auth/status")
+async def auth_status(request: Request):
+    return {"authenticated":valid_session(request.cookies.get("remote_session")),"configured":auth_configured()}
 
 def mark_screen_dirty(action="unknown"):
     global last_action
@@ -126,31 +185,43 @@ async def build_stats():
     mem=get_memory_stats()
     return {"server_fps":fps,"frame_bytes":last_frame_bytes,"frame_kb":round(last_frame_bytes/1024,1),"encode_ms":round(last_encode_ms,1),"ram_mb":mem["used_mb"],"ram_limit_mb":mem["limit_mb"],"python_ram_mb":get_process_memory(),"chromium_ram_mb":await browser_memory_estimate(),"cpu_percent":get_cgroup_cpu_percent(),"tabs":len(pages),"active_tab":active_tab_index,"viewport":current_viewport(),"format":stream_settings["format"],"quality":stream_settings["quality"],"interval":stream_settings["interval"],"last_action":last_action,"storage_path":DATA_DIR}
 
-# ---------- Supabase Storage via REST API (no new Python package required) ----------
+# ---------- Supabase Storage ----------
 def supabase_headers():
     if not SUPABASE_URL or not SUPABASE_SECRET_KEY: raise RuntimeError("Supabase is not configured")
     return {"Authorization":"Bearer "+SUPABASE_SECRET_KEY,"apikey":SUPABASE_SECRET_KEY}
 
+def supabase_object_url():
+    return f"{SUPABASE_URL}/storage/v1/object/{urllib.parse.quote(SUPABASE_BUCKET,safe='')}/{urllib.parse.quote(SUPABASE_BACKUP_PATH,safe='/')}"
+
+def supabase_object_exists():
+    req=urllib.request.Request(supabase_object_url(),method="HEAD",headers=supabase_headers())
+    try:
+        with urllib.request.urlopen(req,timeout=30): return True
+    except urllib.error.HTTPError as e:
+        if e.code in (400,404): return False
+        raise RuntimeError(f"Supabase check HTTP {e.code}: {e.read().decode('utf-8','ignore')[:300]}")
+
 def supabase_upload(path):
     with open(path,"rb") as f:data=f.read()
-    url=f"{SUPABASE_URL}/storage/v1/object/{urllib.parse.quote(SUPABASE_BUCKET,safe='')}/{urllib.parse.quote(SUPABASE_BACKUP_PATH,safe='/')}"
-    req=urllib.request.Request(url,data=data,method="POST",headers={**supabase_headers(),"Content-Type":"application/gzip","x-upsert":"true"})
+    req=urllib.request.Request(supabase_object_url(),data=data,method="POST",headers={**supabase_headers(),"Content-Type":"application/gzip","x-upsert":"true"})
     try:
         with urllib.request.urlopen(req,timeout=120) as r:r.read()
     except urllib.error.HTTPError as e:
         body=e.read().decode("utf-8","ignore")
         if e.code not in (409,): raise RuntimeError(f"Supabase upload HTTP {e.code}: {body[:300]}")
-        # Some gateways ignore x-upsert; use PUT for replacement.
-        req=urllib.request.Request(url,data=data,method="PUT",headers={**supabase_headers(),"Content-Type":"application/gzip"})
+        req=urllib.request.Request(supabase_object_url(),data=data,method="PUT",headers={**supabase_headers(),"Content-Type":"application/gzip"})
         with urllib.request.urlopen(req,timeout=120) as r:r.read()
     return len(data)
 
 def supabase_download(path):
-    url=f"{SUPABASE_URL}/storage/v1/object/{urllib.parse.quote(SUPABASE_BUCKET,safe='')}/{urllib.parse.quote(SUPABASE_BACKUP_PATH,safe='/')}"
-    req=urllib.request.Request(url,method="GET",headers=supabase_headers())
+    req=urllib.request.Request(supabase_object_url(),method="GET",headers=supabase_headers())
     try:
         with urllib.request.urlopen(req,timeout=120) as r:data=r.read()
-    except urllib.error.HTTPError as e: raise RuntimeError(f"Supabase download HTTP {e.code}: {e.read().decode('utf-8','ignore')[:300]}")
+    except urllib.error.HTTPError as e:
+        body=e.read().decode("utf-8","ignore")
+        if e.code in (400,404) and "NoSuchKey" in body:
+            raise FileNotFoundError("Cloud backup object does not exist yet")
+        raise RuntimeError(f"Supabase download HTTP {e.code}: {body[:300]}")
     with open(path,"wb") as f:f.write(data)
     return len(data)
 
@@ -177,7 +248,7 @@ def backup_worker():
     try:
         temp=make_archive();size=os.path.getsize(temp)
         if size>50*1024*1024:raise RuntimeError(f"Backup is {size/1048576:.1f} MB; Supabase Free individual-file limit is 50 MB.")
-        n=supabase_upload(temp);backup_status["last_backup"]=time.strftime("%Y-%m-%d %H:%M:%S UTC",time.gmtime());backup_status["size_mb"]=round(n/1048576,2)
+        n=supabase_upload(temp);backup_status["last_backup"]=time.strftime("%Y-%m-%d %H:%M:%S UTC",time.gmtime());backup_status["size_mb"]=round(n/1048576,2);backup_status["cloud_backup_exists"]=True
     except Exception as e:backup_status["last_error"]=str(e)
     finally:
         if temp:
@@ -199,13 +270,18 @@ async def start_browser_context():
 
 async def restore_profile():
     global context,pages,active_tab_index
-    if context:
-        try:await context.close()
-        except:pass
-        context=None
-    pages=[];active_tab_index=0
+    if not backup_status["configured"]: raise RuntimeError("Supabase is not configured")
+    exists=await asyncio.get_running_loop().run_in_executor(None,supabase_object_exists)
+    backup_status["cloud_backup_exists"]=exists
+    if not exists: return False
+    backup_status["busy"]=True;backup_status["last_error"]=None
     fd,archive=tempfile.mkstemp(suffix=".tar.gz");os.close(fd);extract=DATA_DIR+".restore";old=DATA_DIR+".old"
     try:
+        if context:
+            try:await context.close()
+            except:pass
+            context=None
+        pages=[];active_tab_index=0
         await asyncio.get_running_loop().run_in_executor(None,supabase_download,archive)
         if os.path.exists(extract):shutil.rmtree(extract,ignore_errors=True)
         os.makedirs(extract,exist_ok=True)
@@ -214,35 +290,48 @@ async def restore_profile():
         if os.path.exists(DATA_DIR):os.replace(DATA_DIR,old)
         os.replace(extract,DATA_DIR);shutil.rmtree(old,ignore_errors=True)
         await start_browser_context();backup_status["last_restore"]=time.strftime("%Y-%m-%d %H:%M:%S UTC",time.gmtime())
+        return True
     finally:
         try:os.remove(archive)
         except:pass
         if os.path.exists(extract):shutil.rmtree(extract,ignore_errors=True)
+        backup_status["busy"]=False
 
 @app.on_event("startup")
 async def startup_event():
     global playwright_instance
     os.makedirs(DATA_DIR,exist_ok=True)
+    if not auth_configured():
+        print("WARNING: AUTH_USERNAME, AUTH_PASSWORD and AUTH_SECRET must be set in Render before the browser is publicly usable.")
     playwright_instance=await async_playwright().start()
-    await start_browser_context()
-    if AUTO_BACKUP_MINUTES>0:
-        asyncio.create_task(auto_backup_loop())
+    restored=False
+    if backup_status["configured"]:
+        try: restored=await restore_profile()
+        except Exception as e: backup_status["last_error"]=f"Startup restore failed: {e}"
+    if not restored:
+        await start_browser_context()
+    asyncio.create_task(auto_backup_loop())
 
 @app.on_event("shutdown")
 async def shutdown_event():
     global playwright_instance,context
+    # Try one final synchronous backup before Render shuts the process down.
+    if backup_status["configured"] and context:
+        try: await asyncio.get_running_loop().run_in_executor(None,backup_worker)
+        except Exception as e: print("Final backup failed:",e)
     try:
         if context:await context.close()
     finally:
         if playwright_instance:await playwright_instance.stop()
 
 async def auto_backup_loop():
-    await asyncio.sleep(120)
+    await asyncio.sleep(60)
     while True:
         try:
-            if not backup_status["busy"] and backup_status["configured"]:await asyncio.get_running_loop().run_in_executor(None,backup_worker)
-        except:pass
-        await asyncio.sleep(max(60,AUTO_BACKUP_MINUTES*60))
+            if not backup_status["busy"] and backup_status["configured"]:
+                await asyncio.get_running_loop().run_in_executor(None,backup_worker)
+        except Exception as e: backup_status["last_error"]=str(e)
+        await asyncio.sleep(AUTO_BACKUP_MINUTES*60)
 
 @app.get("/",response_class=HTMLResponse)
 async def root():
@@ -292,6 +381,19 @@ async def frame_generator():
 
 @app.get("/screen")
 async def screen():return StreamingResponse(frame_generator(),media_type="multipart/x-mixed-replace; boundary=frame",headers={"Cache-Control":"no-cache, no-store, must-revalidate","Pragma":"no-cache","Connection":"keep-alive"})
+
+async def apply_chromium_zoom(page):
+    try:
+        session = await context.new_cdp_session(page)
+        await session.send("Emulation.setPageScaleFactor", {"pageScaleFactor": float(stream_settings.get("chromium_zoom", 1.0))})
+        await session.detach()
+    except Exception:
+        pass
+
+async def apply_zoom_all():
+    for p in list(pages):
+        if not p.is_closed():
+            await apply_chromium_zoom(p)
 
 @app.post("/navigate")
 async def navigate(p:NavigatePayload):
@@ -430,12 +532,10 @@ async def backup():
 async def restore():
     if not backup_status["configured"]:return {"status":"error","message":"Supabase is not configured"}
     if backup_status["busy"]:return {"status":"busy","message":"Backup/restore already running"}
-    backup_status["busy"]=True;backup_status["last_error"]=None
     try:
-        await restore_profile();return {"status":"success","message":"Profile restored from Supabase"}
+        ok=await restore_profile()
+        return {"status":"success","message":"Profile restored from Supabase" if ok else "No cloud backup exists yet; browser was left unchanged","restored":ok}
     except Exception as e:backup_status["last_error"]=str(e);return {"status":"error","message":str(e)}
-    finally:backup_status["busy"]=False
 
 @app.get("/stats")
-async def stats():
-    return await build_stats()
+async def stats():return await build_stats()
