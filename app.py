@@ -13,12 +13,11 @@ import json
 import traceback
 import tarfile
 import tempfile
-import shutil
 import hmac
 import hashlib
 import base64
 from urllib import request as urllib_request
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 
 app = FastAPI(title="Remote Chromium Browser")
 
@@ -37,11 +36,13 @@ app.add_middleware(
 DATA_DIR = os.getenv("BROWSER_DATA_DIR", "/app/user_data")
 MAX_TABS = int(os.getenv("MAX_TABS", "8"))
 
+# Authentication (set these in Render environment variables)
 AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
 AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "change-me")
 AUTH_SECRET = os.getenv("AUTH_SECRET", "change-this-to-a-long-random-secret")
 AUTH_COOKIE = "remote_chromium_session"
 
+# Supabase Storage backup configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "browser-backup")
@@ -61,10 +62,6 @@ stream_settings = {
     "width": 854,
     "height": 480,
     "max_pixels": 854 * 480,
-    "auto_device_size": False,
-    "device_width": 360,
-    "device_height": 740,
-    "chromium_ui_scale": 1.0,
 }
 
 # ------------------------------------------------------------
@@ -115,14 +112,14 @@ class SettingsPayload(BaseModel):
     width: Optional[int] = None
     height: Optional[int] = None
     max_pixels: Optional[int] = None
-    auto_device_size: Optional[bool] = None
-    device_width: Optional[int] = None
-    device_height: Optional[int] = None
-    chromium_ui_scale: Optional[float] = None
 
 # ------------------------------------------------------------
 # Authentication + Supabase profile backup
 # ------------------------------------------------------------
+
+class LoginPayload(BaseModel):
+    username: str
+    password: str
 
 def _auth_token():
     user = AUTH_USERNAME.encode("utf-8")
@@ -130,15 +127,13 @@ def _auth_token():
     return base64.urlsafe_b64encode(user + b"." + sig).decode("ascii")
 
 def _valid_token(token):
-    if not token:
-        return False
-    return hmac.compare_digest(token, _auth_token())
+    return bool(token) and hmac.compare_digest(token, _auth_token())
 
 def _storage_url():
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return None
     bucket = urllib.parse.quote(SUPABASE_BUCKET, safe="")
-    obj = "/".join(urllib.parse.quote(p, safe="") for p in SUPABASE_OBJECT.split("/"))
+    obj = "/".join(urllib.parse.quote(part, safe="") for part in SUPABASE_OBJECT.split("/"))
     return f"{SUPABASE_URL}/storage/v1/object/{bucket}/{obj}"
 
 def _profile_has_data():
@@ -147,11 +142,22 @@ def _profile_has_data():
     except Exception:
         return False
 
+def _safe_extract_tar(archive_path):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    root = os.path.realpath(DATA_DIR)
+    with tarfile.open(archive_path, "r:gz") as tar:
+        for member in tar.getmembers():
+            target = os.path.realpath(os.path.join(root, member.name))
+            if not (target == root or target.startswith(root + os.sep)):
+                raise RuntimeError("Unsafe backup archive path")
+        tar.extractall(root)
+
 def _supabase_download():
     global last_backup_error, last_backup_status
     url = _storage_url()
     if not url:
         last_backup_status = "cloud disabled"
+        last_backup_error = None
         return False
     req = urllib_request.Request(url, headers={
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -161,14 +167,13 @@ def _supabase_download():
         with urllib_request.urlopen(req, timeout=30) as resp:
             data = resp.read()
         if not data:
+            last_backup_status = "cloud backup empty"
             return False
         with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz") as tmp:
             tmp.write(data)
             archive = tmp.name
         try:
-            os.makedirs(DATA_DIR, exist_ok=True)
-            with tarfile.open(archive, "r:gz") as tar:
-                tar.extractall(DATA_DIR)
+            _safe_extract_tar(archive)
             last_backup_status = "restored from cloud"
             last_backup_error = None
             return True
@@ -176,14 +181,16 @@ def _supabase_download():
             try: os.unlink(archive)
             except Exception: pass
     except HTTPError as e:
-        # No object yet is normal on the first launch.
         if e.code == 404:
             last_backup_status = "no cloud backup yet"
             last_backup_error = None
         else:
-            last_backup_error = f"Supabase download HTTP {e.code}: {e.read().decode('utf-8','replace')}"
+            body = e.read().decode("utf-8", "replace")
+            last_backup_status = "restore failed"
+            last_backup_error = f"Supabase download HTTP {e.code}: {body}"
         return False
     except Exception as e:
+        last_backup_status = "restore failed"
         last_backup_error = f"Supabase download: {e}"
         return False
 
@@ -194,13 +201,13 @@ def _make_profile_archive():
         if os.path.isdir(DATA_DIR):
             for root, dirs, files in os.walk(DATA_DIR):
                 for name in files:
-                    # Chromium lock/socket files must not be restored.
+                    # Do not back up Chromium's live lock/socket files.
                     if name in {"SingletonLock", "SingletonSocket", "SingletonCookie"}:
                         continue
                     path = os.path.join(root, name)
-                    arc = os.path.relpath(path, DATA_DIR)
+                    arcname = os.path.relpath(path, DATA_DIR)
                     try:
-                        tar.add(path, arcname=arc, recursive=False)
+                        tar.add(path, arcname=arcname, recursive=False)
                     except FileNotFoundError:
                         pass
     return archive
@@ -210,28 +217,31 @@ def _supabase_upload_archive(archive):
     url = _storage_url()
     if not url:
         last_backup_status = "cloud disabled"
+        last_backup_error = None
         return False
-    data = Path(archive).read_bytes()
-    req = urllib_request.Request(
-        url,
-        data=data,
-        method="PUT",
-        headers={
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            "Content-Type": "application/gzip",
-            "x-upsert": "true",
-        },
-    )
     try:
-        with urllib_request.urlopen(req, timeout=60) as resp:
+        with open(archive, "rb") as f:
+            data = f.read()
+        req = urllib_request.Request(
+            url,
+            data=data,
+            method="PUT",
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Content-Type": "application/gzip",
+                "x-upsert": "true",
+            },
+        )
+        with urllib_request.urlopen(req, timeout=90) as resp:
             resp.read()
         last_backup_time = time.time()
         last_backup_error = None
         last_backup_status = "cloud backup complete"
         return True
     except HTTPError as e:
-        last_backup_error = f"Supabase upload HTTP {e.code}: {e.read().decode('utf-8','replace')}"
+        body = e.read().decode("utf-8", "replace")
+        last_backup_error = f"Supabase upload HTTP {e.code}: {body}"
         last_backup_status = "backup failed"
         return False
     except Exception as e:
@@ -240,7 +250,6 @@ def _supabase_upload_archive(archive):
         return False
 
 async def backup_profile():
-    # Never closes Chromium: backup is a filesystem snapshot while the browser stays alive.
     if backup_lock.locked():
         return False
     async with backup_lock:
@@ -265,9 +274,9 @@ async def backup_loop():
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    path = request.url.path
+    # Only the login page/status and health endpoint are public.
     public = {"/", "/login", "/auth/status", "/favicon.ico", "/health"}
-    if path not in public and not _valid_token(request.cookies.get(AUTH_COOKIE)):
+    if request.url.path not in public and not _valid_token(request.cookies.get(AUTH_COOKIE)):
         return JSONResponse({"detail": "Authentication required"}, status_code=401)
     return await call_next(request)
 
@@ -306,11 +315,6 @@ def clamp_int(value, minimum, maximum):
     return max(minimum, min(maximum, int(value)))
 
 def current_viewport():
-    if stream_settings.get("auto_device_size", True):
-        return {
-            "width": clamp_int(stream_settings.get("device_width", 360), 280, 2560),
-            "height": clamp_int(stream_settings.get("device_height", 740), 400, 3200),
-        }
     return {
         "width": stream_settings["width"],
         "height": stream_settings["height"],
@@ -480,6 +484,7 @@ async def startup_event():
     global playwright_instance, context, pages, active_tab_index
 
     os.makedirs(DATA_DIR, exist_ok=True)
+    # Render filesystem can be temporary. Restore the last cloud profile before Chromium starts.
     if not _profile_has_data():
         await asyncio.to_thread(_supabase_download)
 
@@ -549,7 +554,7 @@ async def shutdown_event():
                 await backup_task
             except asyncio.CancelledError:
                 pass
-        # Final snapshot before shutdown, without restarting Chromium.
+        # One final snapshot without closing Chromium first.
         try:
             await backup_profile()
         except Exception:
@@ -564,25 +569,24 @@ async def shutdown_event():
 # Basic routes
 # ------------------------------------------------------------
 
-
-class LoginPayload(BaseModel):
-    username: str
-    password: str
-
 @app.get("/auth/status")
 async def auth_status(request: Request):
     return {"authenticated": _valid_token(request.cookies.get(AUTH_COOKIE))}
 
 @app.post("/login")
 async def login(payload: LoginPayload, response: Response):
-    if not (
-        hmac.compare_digest(payload.username, AUTH_USERNAME) and
-        hmac.compare_digest(payload.password, AUTH_PASSWORD)
-    ):
+    valid_user = hmac.compare_digest(payload.username, AUTH_USERNAME)
+    valid_pass = hmac.compare_digest(payload.password, AUTH_PASSWORD)
+    if not (valid_user and valid_pass):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     response.set_cookie(
-        AUTH_COOKIE, _auth_token(),
-        httponly=True, secure=True, samesite="lax", max_age=60*60*24*30, path="/"
+        AUTH_COOKIE,
+        _auth_token(),
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 30,
+        path="/",
     )
     return {"status": "success"}
 
@@ -667,19 +671,14 @@ async def update_settings(payload: SettingsPayload):
         stream_settings["max_pixels"] = clamp_int(
             payload.max_pixels, 100000, 2_000_000
         )
-    if payload.auto_device_size is not None:
-        stream_settings["auto_device_size"] = bool(payload.auto_device_size)
-    if payload.device_width is not None:
-        stream_settings["device_width"] = clamp_int(payload.device_width, 280, 2560)
-    if payload.device_height is not None:
-        stream_settings["device_height"] = clamp_int(payload.device_height, 400, 3200)
-    if payload.chromium_ui_scale is not None:
-        stream_settings["chromium_ui_scale"] = max(0.5, min(2.2, float(payload.chromium_ui_scale)))
 
     if context:
         try:
             await context.set_viewport_size(
-                current_viewport()
+                {
+                    "width": stream_settings["width"],
+                    "height": stream_settings["height"],
+                }
             )
         except Exception:
             pass
