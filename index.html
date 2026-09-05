@@ -31,7 +31,7 @@ html,body{
   font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
 }
 
-button,input{
+button,input,textarea{
   font:inherit;
 }
 
@@ -332,6 +332,24 @@ select{
   opacity:.01;
 }
 
+/* Cookie paste container style */
+.cookie-section {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+.cookie-section textarea {
+  width: 100%;
+  height: 60px;
+  background: var(--panel2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px;
+  font-size: 11px;
+  resize: vertical;
+}
+
 @media(max-width:600px){
   .tab{
     min-width:82px;
@@ -339,7 +357,6 @@ select{
   }
 }
 
-/* Added features: authentication + full UI hide. Existing browser UI/scaling is untouched. */
 #loginOverlay{position:fixed;inset:0;z-index:3000;background:#111318;display:flex;align-items:center;justify-content:center;padding:20px}
 #loginOverlay.hidden{display:none}
 .loginCard{width:min(360px,100%);background:#1b1e25;border:1px solid #353a46;border-radius:18px;padding:20px}
@@ -350,7 +367,6 @@ select{
 html.chromeOnly #browserHeader,html.chromeOnly #status,html.chromeOnly #toolPanel,html.chromeOnly #settingsPanel,html.chromeOnly #miniToolButton,html.chromeOnly #keyboardInput{display:none!important}
 html.chromeOnly #browserMain{height:100%!important}
 html.chromeOnly #fullHideButton{display:block}
-
 </style>
 </head>
 
@@ -416,6 +432,13 @@ html.chromeOnly #fullHideButton{display:block}
     <button id="chromeOnlyBtn" class="toolWide">Hide UI</button>
     <button id="backupBtn" class="toolWide">Backup now</button>
     <button id="logoutBtn" class="toolWide">Logout</button>
+  </div>
+
+  <!-- Cookie-Editor Paste Box Section Added Here -->
+  <div class="cookie-section">
+    <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">Paste Cookie-Editor JSON:</div>
+    <textarea id="cookieJsonInput" placeholder="[ { name: '...', value: '...' } ]"></textarea>
+    <button id="importCookiesBtn" style="width:100%;margin-top:6px;min-height:30px;font-size:11px;">Inject Cookies</button>
   </div>
 </section>
 
@@ -749,7 +772,7 @@ $("closeTabTool").onclick = async ()=>{
 };
 
 /* ---------------------------------------------------------
-   Tool panel
+   Tool panel & Cookie Ingestion Handler
 --------------------------------------------------------- */
 
 const toolPanel = $("toolPanel");
@@ -767,6 +790,29 @@ function closeTools(){
 
 miniToolButton.onclick = openTools;
 $("collapseBtn").onclick = closeTools;
+
+$("importCookiesBtn").onclick = async () => {
+  const rawText = $("cookieJsonInput").value.trim();
+  if(!rawText) {
+    setStatus("Please paste your cookies JSON first.");
+    return;
+  }
+  try {
+    const cookies = JSON.parse(rawText);
+    setStatus("Injecting cookies...");
+    const res = await jsonPost("/import-cookies", { cookies });
+    if(res.status === "success") {
+      setStatus(`Successfully imported ${res.imported} cookies!`);
+      $("cookieJsonInput").value = "";
+      // Refresh current page to apply the cookies immediately
+      timedAction("/reload");
+    } else {
+      setStatus("Failed: " + (res.message || "Unknown error"));
+    }
+  } catch(e) {
+    setStatus("Invalid JSON format. Check your copied cookies.");
+  }
+};
 
 /* ---------------------------------------------------------
    Settings
@@ -882,14 +928,6 @@ function pushSettings(){
 /* ---------------------------------------------------------
    Stream surface / touch
 --------------------------------------------------------- */
-
-/*
-  IMPORTANT:
-  The image itself has pointer-events:none.
-  All touch/pointer events land on #touchLayer.
-  This prevents Android long-press from opening the image-save/download
-  menu on the streamed screenshot.
-*/
 
 touchLayer.addEventListener("contextmenu",e=>e.preventDefault());
 touchLayer.addEventListener("dragstart",e=>e.preventDefault());
@@ -1046,7 +1084,6 @@ $("scrollDownBtn").onclick = ()=>{
 };
 
 $("rightClickBtn").onclick = async ()=>{
-  // Right click at the center of the remote viewport.
   await timedAction("/touch",{
     x:Number($("width").value)/2,
     y:Number($("height").value)/2,
@@ -1055,7 +1092,7 @@ $("rightClickBtn").onclick = async ()=>{
 };
 
 /* ---------------------------------------------------------
-   Keyboard — batched exact text
+   Keyboard
 --------------------------------------------------------- */
 
 const keyboardInput = $("keyboardInput");
@@ -1114,11 +1151,6 @@ keyboardInput.addEventListener("beforeinput",e=>{
 });
 
 keyboardInput.addEventListener("input",e=>{
-  /*
-    Fallback for Android keyboards that don't expose useful beforeinput
-    events. We only send the newly inserted text and then reset the
-    local buffer.
-  */
   if(e.isComposing) return;
 
   const value = keyboardInput.value;
@@ -1134,12 +1166,6 @@ keyboardInput.addEventListener("compositionend",e=>{
     queueText(e.data);
   }
   keyboardInput.value = "";
-});
-
-keyboardInput.addEventListener("blur",()=>{
-  if(keyboardOpen){
-    // Keep state; user can reopen it.
-  }
 });
 
 /* ---------------------------------------------------------
@@ -1319,13 +1345,6 @@ screenStream.addEventListener("error",()=>{
   },1000);
 });
 
-window.addEventListener("resize",()=>{
-  // Remote coordinates are mapped from the actual surface rectangle,
-  // so no fixed mobile calibration is needed.
-});
-
-
-/* Small draggable restore button for Hide UI mode. */
 (function(){
   const b = $("fullHideButton");
   let dragging=false, sx=0, sy=0, sl=0, st=0;
