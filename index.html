@@ -339,13 +339,14 @@ select{
   }
 }
 
-#loginOverlay{position:fixed;inset:0;z-index:1000;background:#111318;display:flex;align-items:center;justify-content:center;padding:20px}
+/* Added features: authentication + full UI hide. Existing browser UI/scaling is untouched. */
+#loginOverlay{position:fixed;inset:0;z-index:3000;background:#111318;display:flex;align-items:center;justify-content:center;padding:20px}
 #loginOverlay.hidden{display:none}
 .loginCard{width:min(360px,100%);background:#1b1e25;border:1px solid #353a46;border-radius:18px;padding:20px}
 .loginCard h2{margin:0 0 14px}
 .loginCard input{width:100%;margin:6px 0;padding:11px;border-radius:10px;border:1px solid #353a46;background:#242832;color:#fff}
 .loginCard button{width:100%;margin-top:10px}
-#fullHideButton{position:fixed;z-index:2000;width:32px;height:32px;min-height:32px;padding:0;border-radius:50%;font-size:14px;display:none;touch-action:none;box-shadow:0 3px 12px rgba(0,0,0,.45)}
+#fullHideButton{position:fixed;z-index:2500;right:8px;bottom:8px;width:32px;height:32px;min-height:32px;padding:0;border-radius:50%;font-size:14px;display:none;touch-action:none;box-shadow:0 3px 12px rgba(0,0,0,.45)}
 html.chromeOnly #browserHeader,html.chromeOnly #status,html.chromeOnly #toolPanel,html.chromeOnly #settingsPanel,html.chromeOnly #miniToolButton,html.chromeOnly #keyboardInput{display:none!important}
 html.chromeOnly #browserMain{height:100%!important}
 html.chromeOnly #fullHideButton{display:block}
@@ -366,7 +367,6 @@ html.chromeOnly #fullHideButton{display:block}
   </div>
 </div>
 <button id="fullHideButton" title="Show controls">☰</button>
-
 
 <header id="browserHeader">
   <div id="tabsBar"></div>
@@ -483,6 +483,7 @@ html.chromeOnly #fullHideButton{display:block}
   <div style="margin-top:10px;font-size:10px;color:#9ca3af">
     Storage: <span id="storageText">checking…</span>
   </div>
+  <div id="backupStatus" style="margin-top:5px;font-size:10px;color:#9ca3af">Cloud: checking…</div>
 </section>
 
 <textarea id="keyboardInput"
@@ -496,7 +497,6 @@ const $ = id => document.getElementById(id);
 
 const screenStream = $("screenStream");
 const screenSurface = $("screenSurface");
-let remoteViewport = {width:360,height:740};
 const touchLayer = $("touchLayer");
 const statusEl = $("status");
 
@@ -520,67 +520,93 @@ let statsTimer = null;
 let typeQueue = "";
 let typeTimer = null;
 
-function setStatus(text){
-  statusEl.textContent = text;
-}
-
-let uiSleeping = false;
 let backupTimer = null;
+let uiSleeping = false;
 
 async function checkAuth(){
   try{
-    const r=await fetch("/auth/status",{cache:"no-store",credentials:"same-origin"});
-    const d=await r.json();
-    if(d.authenticated){ $("loginOverlay").classList.add("hidden"); return true; }
+    const r = await fetch("/auth/status", {cache:"no-store", credentials:"same-origin"});
+    const d = await r.json();
+    if(d.authenticated){
+      $("loginOverlay").classList.add("hidden");
+      return true;
+    }
   }catch{}
   $("loginOverlay").classList.remove("hidden");
   return false;
 }
+
 async function doLogin(){
-  const err=$("loginError"); err.textContent="";
+  const err = $("loginError");
+  err.textContent = "";
   try{
-    const r=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",
-      body:JSON.stringify({username:$("loginUser").value,password:$("loginPass").value})});
-    if(!r.ok){throw new Error("Wrong username or password");}
+    const r = await fetch("/login", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      credentials:"same-origin",
+      body:JSON.stringify({
+        username:$("loginUser").value,
+        password:$("loginPass").value
+      })
+    });
+    if(!r.ok){
+      const data = await r.json().catch(()=>null);
+      throw new Error(data?.detail || "Wrong username or password");
+    }
     $("loginOverlay").classList.add("hidden");
     location.reload();
-  }catch(e){err.textContent=e.message;}
-}
-$("loginBtn").onclick=doLogin;
-$("loginPass").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
-
-function setChromeOnly(on){
-  uiSleeping=on;
-  document.documentElement.classList.toggle("chromeOnly",on);
-  if(on){
-    if(statsTimer){clearInterval(statsTimer);statsTimer=null;}
-    if(backupTimer){clearInterval(backupTimer);backupTimer=null;}
-  }else{
-    if(!statsTimer)statsTimer=setInterval(updateStats,1000);
-    if(!backupTimer)backupTimer=setInterval(updateBackupStatus,5000);
-    updateStats(); updateBackupStatus();
+  }catch(e){
+    err.textContent = e.message || "Login failed";
   }
 }
-$("chromeOnlyBtn").onclick=()=>setChromeOnly(true);
-$("fullHideButton").onclick=()=>setChromeOnly(false);
+$("loginBtn").onclick = doLogin;
+$("loginPass").addEventListener("keydown", e=>{ if(e.key === "Enter") doLogin(); });
 
-$("backupBtn").onclick=async()=>{
+function setChromeOnly(on){
+  uiSleeping = !!on;
+  document.documentElement.classList.toggle("chromeOnly", uiSleeping);
+  if(uiSleeping){
+    if(statsTimer){ clearInterval(statsTimer); statsTimer = null; }
+  }else{
+    if(!statsTimer) statsTimer = setInterval(updateStats,1000);
+    updateStats();
+  }
+}
+
+$("chromeOnlyBtn").onclick = ()=>setChromeOnly(true);
+$("fullHideButton").onclick = ()=>setChromeOnly(false);
+
+$("backupBtn").onclick = async()=>{
   setStatus("Creating cloud backup…");
   try{
-    const d=await jsonPost("/backup/now");
-    setStatus(d.status==="success"?"Cloud backup complete":"Backup: "+(d.error||d.message));
-  }catch(e){setStatus("Backup failed: "+e.message);}
+    const data = await jsonPost("/backup/now");
+    setStatus(data.status === "success" ? "Cloud backup complete" : "Backup failed: " + (data.error || data.message || "unknown error"));
+    updateBackupStatus();
+  }catch(e){
+    setStatus("Backup failed");
+  }
 };
-$("logoutBtn").onclick=async()=>{try{await jsonPost("/logout");}catch{} location.reload();};
+
+$("logoutBtn").onclick = async()=>{
+  try{ await jsonPost("/logout"); }catch{}
+  location.reload();
+};
 
 async function updateBackupStatus(){
   try{
-    const r=await api("/backup/status");
-    if(r.status===401)return;
-    const d=await r.json();
-    const el=$("backupStatus");
-    if(el)el.textContent=`Cloud: ${d.status} | Last: ${d.last_backup?new Date(d.last_backup*1000).toLocaleTimeString():"never"}`;
+    const r = await api("/backup/status");
+    if(r.status === 401) return;
+    const d = await r.json();
+    const el = $("backupStatus");
+    if(el){
+      const last = d.last_backup ? new Date(d.last_backup * 1000).toLocaleTimeString() : "never";
+      el.textContent = `Cloud: ${d.status} | Last backup: ${last}${d.error ? " | Error: " + d.error : ""}`;
+    }
   }catch{}
+}
+
+function setStatus(text){
+  statusEl.textContent = text;
 }
 
 function api(path, options={}){
@@ -800,11 +826,13 @@ async function loadSettings(){
     const r = await api("/settings");
     const d = await r.json();
     const s = d.settings || {};
+
     $("format").value = s.format || "png";
     $("quality").value = s.quality ?? 70;
     $("interval").value = s.interval ?? 180;
     $("width").value = s.width ?? 854;
     $("height").value = s.height ?? 480;
+
     updateSettingLabels();
   }catch{}
 }
@@ -834,8 +862,7 @@ function pushSettings(){
         quality:Number($("quality").value),
         interval:Number($("interval").value),
         width:Number($("width").value),
-        height:Number($("height").value),
-        auto_device_size:false
+        height:Number($("height").value)
       });
 
       updateSettingLabels();
@@ -852,7 +879,40 @@ function pushSettings(){
   $(id).addEventListener("change",pushSettings);
 });
 
-function sendPointerClick(e, action="click"){
+/* ---------------------------------------------------------
+   Stream surface / touch
+--------------------------------------------------------- */
+
+/*
+  IMPORTANT:
+  The image itself has pointer-events:none.
+  All touch/pointer events land on #touchLayer.
+  This prevents Android long-press from opening the image-save/download
+  menu on the streamed screenshot.
+*/
+
+touchLayer.addEventListener("contextmenu",e=>e.preventDefault());
+touchLayer.addEventListener("dragstart",e=>e.preventDefault());
+screenSurface.addEventListener("contextmenu",e=>e.preventDefault());
+screenStream.addEventListener("contextmenu",e=>e.preventDefault());
+screenStream.addEventListener("dragstart",e=>e.preventDefault());
+
+function remoteCoords(e){
+  const rect = screenSurface.getBoundingClientRect();
+
+  const x = ((e.clientX - rect.left) / rect.width) *
+    Number($("width").value);
+
+  const y = ((e.clientY - rect.top) / rect.height) *
+    Number($("height").value);
+
+  return {
+    x:Math.max(0,Math.min(Number($("width").value)-1,x)),
+    y:Math.max(0,Math.min(Number($("height").value)-1,y))
+  };
+}
+
+async function sendPointerClick(e, action="click"){
   const p = remoteCoords(e);
   await timedAction("/touch",{
     x:p.x,
@@ -1255,19 +1315,51 @@ screenStream.addEventListener("error",()=>{
   setStatus("Stream error — reconnecting…");
 
   setTimeout(()=>{
-    checkAuth();
-screenStream.src = "/screen?ts=" + Date.now();
+    screenStream.src = "/screen?ts=" + Date.now();
   },1000);
 });
 
+window.addEventListener("resize",()=>{
+  // Remote coordinates are mapped from the actual surface rectangle,
+  // so no fixed mobile calibration is needed.
+});
+
+
+/* Small draggable restore button for Hide UI mode. */
 (function(){
- const b=$("fullHideButton"); let drag=false,sx=0,sy=0,sl=0,st=0;
- const saved=JSON.parse(localStorage.getItem("remoteMiniPos")||"null");
- if(saved){b.style.left=saved.x+"px";b.style.top=saved.y+"px";b.style.right="auto";b.style.bottom="auto";}
- b.addEventListener("pointerdown",e=>{drag=false;sx=e.clientX;sy=e.clientY;const r=b.getBoundingClientRect();sl=r.left;st=r.top;b.setPointerCapture(e.pointerId);});
- b.addEventListener("pointermove",e=>{if(!b.hasPointerCapture(e.pointerId))return;const dx=e.clientX-sx,dy=e.clientY-sy;if(Math.abs(dx)+Math.abs(dy)>4)drag=true;if(drag){b.style.left=Math.max(0,Math.min(innerWidth-b.offsetWidth,sl+dx))+"px";b.style.top=Math.max(0,Math.min(innerHeight-b.offsetHeight,st+dy))+"px";b.style.right="auto";b.style.bottom="auto";}});
- b.addEventListener("pointerup",e=>{if(drag){const r=b.getBoundingClientRect();localStorage.setItem("remoteMiniPos",JSON.stringify({x:r.left,y:r.top}));e.preventDefault();}});
+  const b = $("fullHideButton");
+  let dragging=false, sx=0, sy=0, sl=0, st=0;
+  const saved = JSON.parse(localStorage.getItem("remoteMiniPos") || "null");
+  if(saved){
+    b.style.left = saved.x + "px";
+    b.style.top = saved.y + "px";
+    b.style.right = "auto";
+    b.style.bottom = "auto";
+  }
+  b.addEventListener("pointerdown", e=>{
+    dragging=false; sx=e.clientX; sy=e.clientY;
+    const r=b.getBoundingClientRect(); sl=r.left; st=r.top;
+    b.setPointerCapture(e.pointerId);
+  });
+  b.addEventListener("pointermove", e=>{
+    if(!b.hasPointerCapture(e.pointerId)) return;
+    const dx=e.clientX-sx, dy=e.clientY-sy;
+    if(Math.abs(dx)+Math.abs(dy)>4) dragging=true;
+    if(dragging){
+      b.style.left=Math.max(0,Math.min(innerWidth-b.offsetWidth,sl+dx))+"px";
+      b.style.top=Math.max(0,Math.min(innerHeight-b.offsetHeight,st+dy))+"px";
+      b.style.right="auto"; b.style.bottom="auto";
+    }
+  });
+  b.addEventListener("pointerup", e=>{
+    if(dragging){
+      const r=b.getBoundingClientRect();
+      localStorage.setItem("remoteMiniPos", JSON.stringify({x:r.left,y:r.top}));
+      e.preventDefault();
+    }
+  });
 })();
+
 </script>
 </body>
 </html>
