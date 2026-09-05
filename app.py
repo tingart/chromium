@@ -1,6 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from typing import Optional, List
@@ -11,15 +11,14 @@ import os
 import time
 import json
 import traceback
+import tarfile
+import tempfile
 import shutil
-import secrets
+import hmac
 import hashlib
 import base64
-import tempfile
-import tarfile
-from pathlib import Path
-from fastapi import Request, HTTPException
-from fastapi.responses import JSONResponse
+from urllib import request as urllib_request
+from urllib.error import HTTPError, URLError
 
 app = FastAPI(title="Remote Chromium Browser")
 
@@ -36,28 +35,24 @@ app.add_middleware(
 # ------------------------------------------------------------
 
 DATA_DIR = os.getenv("BROWSER_DATA_DIR", "/app/user_data")
-
 MAX_TABS = int(os.getenv("MAX_TABS", "8"))
 
-# Authentication. Change these in Render environment variables.
 AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
-AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "lunos123")
-AUTH_SECRET = os.getenv("AUTH_SECRET", "change-this-secret")
-SESSION_COOKIE = "chromium_session"
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "change-me")
+AUTH_SECRET = os.getenv("AUTH_SECRET", "change-this-to-a-long-random-secret")
+AUTH_COOKIE = "remote_chromium_session"
 
-# Supabase Storage.
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "browser-backup")
 SUPABASE_OBJECT = os.getenv("SUPABASE_OBJECT", "chromium-profile.tar.gz")
+BACKUP_INTERVAL = max(60, int(os.getenv("BACKUP_INTERVAL", "300")))
 
-BACKUP_INTERVAL = max(30, int(os.getenv("BACKUP_INTERVAL", "120")))
-backup_lock = asyncio.Lock()
 backup_task = None
+backup_lock = asyncio.Lock()
 last_backup_time = None
 last_backup_error = None
-last_backup_size = 0
-backup_in_progress = False
+last_backup_status = "no backup yet"
 
 stream_settings = {
     "format": "png",          # png / jpeg / webp
@@ -69,6 +64,7 @@ stream_settings = {
     "auto_device_size": True,
     "device_width": 360,
     "device_height": 740,
+    "chromium_ui_scale": 1.0,
 }
 
 # ------------------------------------------------------------
@@ -122,6 +118,158 @@ class SettingsPayload(BaseModel):
     auto_device_size: Optional[bool] = None
     device_width: Optional[int] = None
     device_height: Optional[int] = None
+    chromium_ui_scale: Optional[float] = None
+
+# ------------------------------------------------------------
+# Authentication + Supabase profile backup
+# ------------------------------------------------------------
+
+def _auth_token():
+    user = AUTH_USERNAME.encode("utf-8")
+    sig = hmac.new(AUTH_SECRET.encode("utf-8"), user, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(user + b"." + sig).decode("ascii")
+
+def _valid_token(token):
+    if not token:
+        return False
+    return hmac.compare_digest(token, _auth_token())
+
+def _storage_url():
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    bucket = urllib.parse.quote(SUPABASE_BUCKET, safe="")
+    obj = "/".join(urllib.parse.quote(p, safe="") for p in SUPABASE_OBJECT.split("/"))
+    return f"{SUPABASE_URL}/storage/v1/object/{bucket}/{obj}"
+
+def _profile_has_data():
+    try:
+        return os.path.isdir(DATA_DIR) and any(True for _ in os.scandir(DATA_DIR))
+    except Exception:
+        return False
+
+def _supabase_download():
+    global last_backup_error, last_backup_status
+    url = _storage_url()
+    if not url:
+        last_backup_status = "cloud disabled"
+        return False
+    req = urllib_request.Request(url, headers={
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    })
+    try:
+        with urllib_request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+        if not data:
+            return False
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz") as tmp:
+            tmp.write(data)
+            archive = tmp.name
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with tarfile.open(archive, "r:gz") as tar:
+                tar.extractall(DATA_DIR)
+            last_backup_status = "restored from cloud"
+            last_backup_error = None
+            return True
+        finally:
+            try: os.unlink(archive)
+            except Exception: pass
+    except HTTPError as e:
+        # No object yet is normal on the first launch.
+        if e.code == 404:
+            last_backup_status = "no cloud backup yet"
+            last_backup_error = None
+        else:
+            last_backup_error = f"Supabase download HTTP {e.code}: {e.read().decode('utf-8','replace')}"
+        return False
+    except Exception as e:
+        last_backup_error = f"Supabase download: {e}"
+        return False
+
+def _make_profile_archive():
+    fd, archive = tempfile.mkstemp(suffix=".tar.gz")
+    os.close(fd)
+    with tarfile.open(archive, "w:gz") as tar:
+        if os.path.isdir(DATA_DIR):
+            for root, dirs, files in os.walk(DATA_DIR):
+                for name in files:
+                    # Chromium lock/socket files must not be restored.
+                    if name in {"SingletonLock", "SingletonSocket", "SingletonCookie"}:
+                        continue
+                    path = os.path.join(root, name)
+                    arc = os.path.relpath(path, DATA_DIR)
+                    try:
+                        tar.add(path, arcname=arc, recursive=False)
+                    except FileNotFoundError:
+                        pass
+    return archive
+
+def _supabase_upload_archive(archive):
+    global last_backup_time, last_backup_error, last_backup_status
+    url = _storage_url()
+    if not url:
+        last_backup_status = "cloud disabled"
+        return False
+    data = Path(archive).read_bytes()
+    req = urllib_request.Request(
+        url,
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Content-Type": "application/gzip",
+            "x-upsert": "true",
+        },
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=60) as resp:
+            resp.read()
+        last_backup_time = time.time()
+        last_backup_error = None
+        last_backup_status = "cloud backup complete"
+        return True
+    except HTTPError as e:
+        last_backup_error = f"Supabase upload HTTP {e.code}: {e.read().decode('utf-8','replace')}"
+        last_backup_status = "backup failed"
+        return False
+    except Exception as e:
+        last_backup_error = f"Supabase upload: {e}"
+        last_backup_status = "backup failed"
+        return False
+
+async def backup_profile():
+    # Never closes Chromium: backup is a filesystem snapshot while the browser stays alive.
+    if backup_lock.locked():
+        return False
+    async with backup_lock:
+        archive = None
+        try:
+            archive = await asyncio.to_thread(_make_profile_archive)
+            return await asyncio.to_thread(_supabase_upload_archive, archive)
+        finally:
+            if archive:
+                try: os.unlink(archive)
+                except Exception: pass
+
+async def backup_loop():
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL)
+        try:
+            await backup_profile()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    public = {"/", "/login", "/auth/status", "/favicon.ico", "/health"}
+    if path not in public and not _valid_token(request.cookies.get(AUTH_COOKIE)):
+        return JSONResponse({"detail": "Authentication required"}, status_code=401)
+    return await call_next(request)
 
 # ------------------------------------------------------------
 # Helpers
@@ -160,8 +308,8 @@ def clamp_int(value, minimum, maximum):
 def current_viewport():
     if stream_settings.get("auto_device_size", True):
         return {
-            "width": clamp_int(stream_settings.get("device_width", 360), 280, 1600),
-            "height": clamp_int(stream_settings.get("device_height", 740), 480, 1800),
+            "width": clamp_int(stream_settings.get("device_width", 360), 280, 2560),
+            "height": clamp_int(stream_settings.get("device_height", 740), 400, 3200),
         }
     return {
         "width": stream_settings["width"],
@@ -321,260 +469,7 @@ async def build_stats():
         "interval": stream_settings["interval"],
         "last_action": last_action,
         "storage_path": DATA_DIR,
-        "auth": True,
-        "supabase_backup": supabase_configured(),
     }
-
-
-# ------------------------------------------------------------
-# Authentication
-# ------------------------------------------------------------
-
-PUBLIC_PATHS = {"/", "/login", "/auth/status", "/health", "/favicon.ico"}
-
-def make_session_token():
-    raw = f"{AUTH_USERNAME}:{AUTH_SECRET}:{secrets.token_urlsafe(32)}"
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-def valid_session(request: Request):
-    token = request.cookies.get(SESSION_COOKIE)
-    return bool(token and secrets.compare_digest(token, request.app.state.session_token))
-
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    path = request.url.path
-    if path in PUBLIC_PATHS or path.startswith("/static/"):
-        return await call_next(request)
-    if not valid_session(request):
-        return JSONResponse({"status": "unauthorized", "message": "Login required"}, status_code=401)
-    return await call_next(request)
-
-class LoginPayload(BaseModel):
-    username: str
-    password: str
-
-@app.get("/auth/status")
-async def auth_status(request: Request):
-    return {
-        "authenticated": valid_session(request),
-        "username": AUTH_USERNAME if valid_session(request) else None,
-    }
-
-@app.post("/login")
-async def login(payload: LoginPayload):
-    if not (
-        secrets.compare_digest(payload.username, AUTH_USERNAME)
-        and secrets.compare_digest(payload.password, AUTH_PASSWORD)
-    ):
-        return JSONResponse(
-            {"status": "error", "message": "Invalid username or password"},
-            status_code=401
-        )
-    token = make_session_token()
-    app.state.session_token = token
-    response = JSONResponse({"status": "success"})
-    response.set_cookie(
-        SESSION_COOKIE,
-        token,
-        httponly=True,
-        secure=True,
-        samesite="lax",
-        max_age=60 * 60 * 24 * 30,
-        path="/",
-    )
-    return response
-
-@app.post("/logout")
-async def logout(request: Request):
-    response = JSONResponse({"status": "success"})
-    response.delete_cookie(SESSION_COOKIE, path="/")
-    return response
-
-# ------------------------------------------------------------
-# Supabase backup / restore
-# ------------------------------------------------------------
-
-def supabase_headers(content_type=None):
-    h = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "apikey": SUPABASE_SERVICE_KEY,
-    }
-    if content_type:
-        h["Content-Type"] = content_type
-    return h
-
-def supabase_configured():
-    return bool(SUPABASE_URL and SUPABASE_SERVICE_KEY and SUPABASE_BUCKET)
-
-def supabase_object_url():
-    from urllib.parse import quote
-    return (
-        f"{SUPABASE_URL}/storage/v1/object/"
-        f"{quote(SUPABASE_BUCKET, safe='')}/"
-        f"{quote(SUPABASE_OBJECT, safe='/')}"
-    )
-
-def create_profile_archive():
-    tmp = tempfile.NamedTemporaryFile(prefix="chromium-backup-", suffix=".tar.gz", delete=False)
-    tmp.close()
-    archive = tmp.name
-
-    # Exclude transient lock/cache files that can break restoration.
-    excluded_names = {
-        "SingletonLock", "SingletonCookie", "SingletonSocket",
-        "DevToolsActivePort"
-    }
-    excluded_dirs = {
-        "Cache", "Code Cache", "GPUCache", "GrShaderCache",
-        "ShaderCache", "Crashpad", "BrowserMetrics"
-    }
-
-    with tarfile.open(archive, "w:gz", compresslevel=6) as tar:
-        root = Path(DATA_DIR)
-        if root.exists():
-            for p in root.rglob("*"):
-                rel = p.relative_to(root)
-                if any(part in excluded_dirs for part in rel.parts):
-                    continue
-                if p.name in excluded_names:
-                    continue
-                try:
-                    tar.add(str(p), arcname=str(rel), recursive=False)
-                except Exception:
-                    pass
-    return archive
-
-def restore_profile_archive(archive):
-    root = Path(DATA_DIR)
-    root.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive, "r:gz") as tar:
-        # Safe extraction: reject absolute paths and traversal.
-        for member in tar.getmembers():
-            target = (root / member.name).resolve()
-            if not str(target).startswith(str(root.resolve()) + os.sep) and target != root.resolve():
-                raise RuntimeError("Unsafe backup archive")
-        tar.extractall(root)
-
-def download_backup_to(path):
-    import urllib.request
-    req = urllib.request.Request(
-        supabase_object_url(),
-        headers=supabase_headers()
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=25) as r, open(path, "wb") as f:
-            shutil.copyfileobj(r, f)
-        return True
-    except Exception as e:
-        # A missing object is a normal first-run condition.
-        if "404" in str(e) or "Not Found" in str(e):
-            return False
-        raise
-
-def upload_backup(path):
-    import urllib.request
-    with open(path, "rb") as f:
-        data = f.read()
-    req = urllib.request.Request(
-        supabase_object_url(),
-        data=data,
-        method="POST",
-        headers={
-            **supabase_headers("application/gzip"),
-            "x-upsert": "true",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            r.read()
-        return len(data)
-    except Exception as e:
-        # Some Supabase deployments require PUT for upsert.
-        req = urllib.request.Request(
-            supabase_object_url(),
-            data=data,
-            method="PUT",
-            headers={
-                **supabase_headers("application/gzip"),
-                "x-upsert": "true",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=60) as r:
-            r.read()
-        return len(data)
-
-async def restore_backup_if_needed():
-    if not supabase_configured():
-        return "not-configured"
-
-    root = Path(DATA_DIR)
-    # Only restore automatically when there is no usable local profile.
-    try:
-        has_profile = any(root.iterdir())
-    except Exception:
-        has_profile = False
-    if has_profile:
-        return "local-profile"
-
-    tmp = tempfile.NamedTemporaryFile(prefix="restore-", suffix=".tar.gz", delete=False)
-    tmp.close()
-    try:
-        ok = await asyncio.to_thread(download_backup_to, tmp.name)
-        if not ok:
-            return "no-backup"
-        await asyncio.to_thread(restore_profile_archive, tmp.name)
-        return "restored"
-    finally:
-        try: os.unlink(tmp.name)
-        except Exception: pass
-
-async def perform_backup(reason="auto"):
-    global last_backup_time, last_backup_error, last_backup_size, backup_in_progress
-
-    if not supabase_configured():
-        last_backup_error = "Supabase not configured"
-        return False
-
-    async with backup_lock:
-        backup_in_progress = True
-        archive = None
-        try:
-            # Flush browser state before archiving without closing Chromium.
-            if context:
-                try:
-                    await context.storage_state()
-                except Exception:
-                    pass
-
-            archive = await asyncio.to_thread(create_profile_archive)
-            size = await asyncio.to_thread(upload_backup, archive)
-            last_backup_time = time.time()
-            last_backup_size = size
-            last_backup_error = None
-            return True
-        except Exception as e:
-            last_backup_error = f"{type(e).__name__}: {e}"
-            return False
-        finally:
-            backup_in_progress = False
-            if archive:
-                try: os.unlink(archive)
-                except Exception: pass
-
-async def backup_loop():
-    while True:
-        try:
-            await asyncio.sleep(BACKUP_INTERVAL)
-            await perform_backup("periodic")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            global last_backup_error
-            last_backup_error = f"{type(e).__name__}: {e}"
-
-async def schedule_backup(reason="change"):
-    # Debounced single backup request.
-    await perform_backup(reason)
 
 # ------------------------------------------------------------
 # Startup / shutdown
@@ -582,17 +477,11 @@ async def schedule_backup(reason="change"):
 
 @app.on_event("startup")
 async def startup_event():
-    global playwright_instance, context, pages, active_tab_index, backup_task
+    global playwright_instance, context, pages, active_tab_index
 
     os.makedirs(DATA_DIR, exist_ok=True)
-    app.state.session_token = make_session_token()
-
-    # Restore only when Render's local profile is empty.
-    try:
-        await restore_backup_if_needed()
-    except Exception as e:
-        global last_backup_error
-        last_backup_error = f"Restore: {type(e).__name__}: {e}"
+    if not _profile_has_data():
+        await asyncio.to_thread(_supabase_download)
 
     playwright_instance = await async_playwright().start()
 
@@ -645,27 +534,26 @@ async def startup_event():
         pages.append(initial_page)
 
     active_tab_index = 0
-    mark_screen_dirty("startup")
+    global backup_task
     backup_task = asyncio.create_task(backup_loop())
+    mark_screen_dirty("startup")
 
 @app.on_event("shutdown")
 async def shutdown_event():
     global playwright_instance, context, backup_task
 
-    if backup_task:
-        backup_task.cancel()
+    try:
+        if backup_task:
+            backup_task.cancel()
+            try:
+                await backup_task
+            except asyncio.CancelledError:
+                pass
+        # Final snapshot before shutdown, without restarting Chromium.
         try:
-            await backup_task
-        except asyncio.CancelledError:
+            await backup_profile()
+        except Exception:
             pass
-
-    # Final backup while the persistent Chromium profile is still available.
-    try:
-        await perform_backup("shutdown")
-    except Exception:
-        pass
-
-    try:
         if context:
             await context.close()
     finally:
@@ -675,6 +563,54 @@ async def shutdown_event():
 # ------------------------------------------------------------
 # Basic routes
 # ------------------------------------------------------------
+
+
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+@app.get("/auth/status")
+async def auth_status(request: Request):
+    return {"authenticated": _valid_token(request.cookies.get(AUTH_COOKIE))}
+
+@app.post("/login")
+async def login(payload: LoginPayload, response: Response):
+    if not (
+        hmac.compare_digest(payload.username, AUTH_USERNAME) and
+        hmac.compare_digest(payload.password, AUTH_PASSWORD)
+    ):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    response.set_cookie(
+        AUTH_COOKIE, _auth_token(),
+        httponly=True, secure=True, samesite="lax", max_age=60*60*24*30, path="/"
+    )
+    return {"status": "success"}
+
+@app.post("/logout")
+async def logout(response: Response):
+    response.delete_cookie(AUTH_COOKIE, path="/")
+    return {"status": "success"}
+
+@app.get("/backup/status")
+async def backup_status():
+    return {
+        "status": last_backup_status,
+        "last_backup": last_backup_time,
+        "error": last_backup_error,
+        "cloud_enabled": bool(_storage_url()),
+        "bucket": SUPABASE_BUCKET,
+        "object": SUPABASE_OBJECT,
+    }
+
+@app.post("/backup/now")
+async def backup_now():
+    ok = await backup_profile()
+    return {
+        "status": "success" if ok else "error",
+        "message": last_backup_status,
+        "last_backup": last_backup_time,
+        "error": last_backup_error,
+    }
 
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
@@ -731,28 +667,24 @@ async def update_settings(payload: SettingsPayload):
         stream_settings["max_pixels"] = clamp_int(
             payload.max_pixels, 100000, 2_000_000
         )
-
     if payload.auto_device_size is not None:
         stream_settings["auto_device_size"] = bool(payload.auto_device_size)
-
     if payload.device_width is not None:
-        stream_settings["device_width"] = clamp_int(payload.device_width, 280, 1600)
-
+        stream_settings["device_width"] = clamp_int(payload.device_width, 280, 2560)
     if payload.device_height is not None:
-        stream_settings["device_height"] = clamp_int(payload.device_height, 480, 1800)
+        stream_settings["device_height"] = clamp_int(payload.device_height, 400, 3200)
+    if payload.chromium_ui_scale is not None:
+        stream_settings["chromium_ui_scale"] = max(0.7, min(1.8, float(payload.chromium_ui_scale)))
 
     if context:
         try:
-            await context.set_viewport_size(current_viewport())
+            await context.set_viewport_size(
+                current_viewport()
+            )
         except Exception:
             pass
 
-    # Keep the server's coordinate space synchronized with the real viewport.
-    stream_settings["width"] = current_viewport()["width"]
-    stream_settings["height"] = current_viewport()["height"]
-
     mark_screen_dirty("settings")
-    asyncio.create_task(perform_backup("settings"))
 
     return {
         "status": "success",
@@ -887,7 +819,6 @@ async def navigate(payload: NavigatePayload):
             )
 
         mark_screen_dirty("navigate")
-        asyncio.create_task(perform_backup("navigate"))
 
         return {
             "status": "success",
@@ -917,7 +848,6 @@ async def history_back():
             )
 
         mark_screen_dirty("back")
-        asyncio.create_task(perform_backup("back"))
         return {"status": "success", "url": page.url}
 
     except Exception as e:
@@ -938,7 +868,6 @@ async def history_forward():
             )
 
         mark_screen_dirty("forward")
-        asyncio.create_task(perform_backup("forward"))
         return {"status": "success", "url": page.url}
 
     except Exception as e:
@@ -959,7 +888,6 @@ async def reload_page():
             )
 
         mark_screen_dirty("reload")
-        asyncio.create_task(perform_backup("reload"))
         return {"status": "success", "url": page.url}
 
     except Exception as e:
@@ -1038,7 +966,6 @@ async def new_tab():
         )
 
         mark_screen_dirty("new-tab")
-        asyncio.create_task(perform_backup("new-tab"))
         return await get_tabs()
 
     except Exception as e:
@@ -1070,7 +997,6 @@ async def switch_tab(payload: dict):
             pass
 
         mark_screen_dirty("switch-tab")
-        asyncio.create_task(perform_backup("switch-tab"))
 
     return await get_tabs()
 
@@ -1097,7 +1023,6 @@ async def close_tab(payload: dict):
             active_tab_index = len(pages) - 1
 
         mark_screen_dirty("close-tab")
-        asyncio.create_task(perform_backup("close-tab"))
 
     return await get_tabs()
 
@@ -1113,8 +1038,8 @@ async def handle_touch(payload: TouchPayload):
         return {"status": "error"}
 
     try:
-        vw = current_viewport()["width"]
-        vh = current_viewport()["height"]
+        vw = stream_settings["width"]
+        vh = stream_settings["height"]
 
         x = max(0, min(float(payload.x), vw - 1))
         y = max(0, min(float(payload.y), vh - 1))
@@ -1145,7 +1070,6 @@ async def handle_touch(payload: TouchPayload):
                 await page.mouse.move(x, y)
 
         mark_screen_dirty(payload.action or "touch")
-        asyncio.create_task(perform_backup("touch"))
 
         return {"status": "success"}
 
@@ -1172,7 +1096,6 @@ async def type_text(payload: TypePayload):
         await page.keyboard.insert_text(payload.text)
 
         mark_screen_dirty("type")
-        asyncio.create_task(perform_backup("type"))
 
         return {
             "status": "success",
@@ -1215,7 +1138,6 @@ async def handle_key(payload: KeyPayload):
         )
 
         mark_screen_dirty("key")
-        asyncio.create_task(perform_backup("key"))
 
         return {"status": "success"}
 
@@ -1277,7 +1199,6 @@ async def cut_selection():
             await page.keyboard.press("Control+X")
 
         mark_screen_dirty("cut")
-        asyncio.create_task(perform_backup("cut"))
 
         return {
             "status": "success",
@@ -1298,29 +1219,6 @@ async def cut_selection():
 @app.get("/stats")
 async def stats():
     return await build_stats()
-
-
-@app.get("/backup/status")
-async def backup_status():
-    return {
-        "configured": supabase_configured(),
-        "bucket": SUPABASE_BUCKET if supabase_configured() else None,
-        "object": SUPABASE_OBJECT if supabase_configured() else None,
-        "last_backup": last_backup_time,
-        "last_backup_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(last_backup_time)) if last_backup_time else None,
-        "last_backup_size": last_backup_size,
-        "error": last_backup_error,
-        "in_progress": backup_in_progress,
-        "interval": BACKUP_INTERVAL,
-        "auto_restore": True,
-    }
-
-@app.post("/backup")
-async def manual_backup():
-    ok = await perform_backup("manual")
-    if not ok:
-        return JSONResponse({"status":"error","message":last_backup_error or "backup failed"}, status_code=500)
-    return {"status":"success","last_backup":last_backup_time,"size":last_backup_size}
 
 @app.get("/storage")
 async def storage():
