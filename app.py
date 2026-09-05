@@ -1,11 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from typing import Optional, List
 from collections import deque
-import asyncio, urllib.parse, urllib.error, os, time, json, tarfile, tempfile, shutil, urllib.request, threading
+import asyncio, urllib.parse, urllib.error, os, time, json, tarfile, tempfile, shutil, urllib.request, threading, secrets, hashlib, hmac, base64
 
 app = FastAPI(title="Remote Chromium Browser")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -17,6 +17,10 @@ SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "browser-backup")
 SUPABASE_BACKUP_PATH = os.getenv("SUPABASE_BACKUP_PATH", "chromium-profile.tar.gz")
 AUTO_BACKUP_MINUTES = max(0, int(os.getenv("AUTO_BACKUP_MINUTES", "15")))
+AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "")
+AUTH_SECRET = os.getenv("AUTH_SECRET", "")
+SESSION_DAYS = max(1, int(os.getenv("SESSION_DAYS", "7")))
 
 stream_settings = {"format":"png","quality":70,"interval":180,"width":854,"height":480,"max_pixels":854*480,"chromium_zoom":1.0}
 playwright_instance = None
@@ -33,6 +37,59 @@ last_action = "startup"
 cpu_prev = cpu_prev_time = None
 backup_lock = threading.Lock()
 backup_status = {"configured":bool(SUPABASE_URL and SUPABASE_SECRET_KEY),"busy":False,"last_backup":None,"last_restore":None,"last_error":None,"size_mb":None}
+
+class LoginPayload(BaseModel):
+    username: str; password: str
+
+# ---------- Login/session protection ----------
+def auth_configured():
+    return bool(AUTH_USERNAME and AUTH_PASSWORD and AUTH_SECRET)
+
+def make_session():
+    ts = str(int(time.time()))
+    nonce = secrets.token_urlsafe(24)
+    raw = ts + "." + nonce
+    sig = hmac.new(AUTH_SECRET.encode(), raw.encode(), hashlib.sha256).digest()
+    return raw + "." + base64.urlsafe_b64encode(sig).decode().rstrip("=")
+
+def valid_session(token):
+    if not token or not auth_configured(): return False
+    try:
+        ts, nonce, sig = token.split(".", 2)
+        if abs(int(time.time()) - int(ts)) > SESSION_DAYS * 86400: return False
+        raw = ts + "." + nonce
+        expected = base64.urlsafe_b64encode(hmac.new(AUTH_SECRET.encode(), raw.encode(), hashlib.sha256).digest()).decode().rstrip("=")
+        return hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
+
+@app.middleware("http")
+async def authentication_middleware(request: Request, call_next):
+    path = request.url.path
+    public = path in {"/", "/login", "/logout", "/auth/status", "/favicon.ico"}
+    if not public and not valid_session(request.cookies.get("remote_session")):
+        return JSONResponse({"status":"error","message":"Authentication required"}, status_code=401)
+    return await call_next(request)
+
+@app.post("/login")
+async def login(payload: LoginPayload):
+    if not auth_configured():
+        return JSONResponse({"status":"error","message":"Authentication is not configured. Set AUTH_USERNAME, AUTH_PASSWORD and AUTH_SECRET in Render."}, status_code=500)
+    if not (hmac.compare_digest(payload.username, AUTH_USERNAME) and hmac.compare_digest(payload.password, AUTH_PASSWORD)):
+        return JSONResponse({"status":"error","message":"Invalid username or password"}, status_code=401)
+    response = JSONResponse({"status":"success"})
+    response.set_cookie("remote_session", make_session(), max_age=SESSION_DAYS*86400, httponly=True, secure=True, samesite="lax", path="/")
+    return response
+
+@app.post("/logout")
+async def logout():
+    response = JSONResponse({"status":"success"})
+    response.delete_cookie("remote_session", path="/")
+    return response
+
+@app.get("/auth/status")
+async def auth_status(request: Request):
+    return {"authenticated": valid_session(request.cookies.get("remote_session")), "configured": auth_configured()}
 
 class NavigatePayload(BaseModel): url: str
 class TouchPayload(BaseModel):
