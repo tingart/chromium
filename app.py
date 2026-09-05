@@ -1,104 +1,277 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from typing import Optional, List
 from collections import deque
-import asyncio, urllib.parse, urllib.error, os, time, json, tarfile, tempfile, shutil, urllib.request, threading, secrets, hashlib, hmac, base64
+import asyncio
+import urllib.parse
+import os
+import time
+import json
+import traceback
+import tarfile
+import tempfile
+import shutil
+import hmac
+import hashlib
+import base64
+from urllib import request as urllib_request
+from urllib.error import HTTPError, URLError
 
 app = FastAPI(title="Remote Chromium Browser")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 
 DATA_DIR = os.getenv("BROWSER_DATA_DIR", "/app/user_data")
 MAX_TABS = int(os.getenv("MAX_TABS", "8"))
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "")
-SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "browser-backup")
-SUPABASE_BACKUP_PATH = os.getenv("SUPABASE_BACKUP_PATH", "chromium-profile.tar.gz")
-AUTO_BACKUP_MINUTES = max(0, int(os.getenv("AUTO_BACKUP_MINUTES", "15")))
-AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
-AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "")
-AUTH_SECRET = os.getenv("AUTH_SECRET", "")
-SESSION_DAYS = max(1, int(os.getenv("SESSION_DAYS", "7")))
 
-stream_settings = {"format":"png","quality":70,"interval":180,"width":854,"height":480,"max_pixels":854*480,"chromium_zoom":1.0}
+AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
+AUTH_PASSWORD = os.getenv("AUTH_PASSWORD", "change-me")
+AUTH_SECRET = os.getenv("AUTH_SECRET", "change-this-to-a-long-random-secret")
+AUTH_COOKIE = "remote_chromium_session"
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "browser-backup")
+SUPABASE_OBJECT = os.getenv("SUPABASE_OBJECT", "chromium-profile.tar.gz")
+BACKUP_INTERVAL = max(60, int(os.getenv("BACKUP_INTERVAL", "300")))
+
+backup_task = None
+backup_lock = asyncio.Lock()
+last_backup_time = None
+last_backup_error = None
+last_backup_status = "no backup yet"
+
+stream_settings = {
+    "format": "png",          # png / jpeg / webp
+    "quality": 70,            # jpeg/webp quality
+    "interval": 180,          # target frame interval in ms
+    "width": 854,
+    "height": 480,
+    "max_pixels": 854 * 480,
+    "auto_device_size": True,
+    "device_width": 360,
+    "device_height": 740,
+}
+
+# ------------------------------------------------------------
+# Global browser state
+# ------------------------------------------------------------
+
 playwright_instance = None
 context = None
 pages: List = []
 active_tab_index = 0
+
 page_lock = asyncio.Lock()
 screen_event = asyncio.Event()
 last_frame = None
+
 frame_times = deque(maxlen=240)
 last_encode_ms = 0.0
 last_frame_bytes = 0
 last_action = "startup"
-cpu_prev = cpu_prev_time = None
-backup_lock = threading.Lock()
-backup_status = {"configured":bool(SUPABASE_URL and SUPABASE_SECRET_KEY),"busy":False,"last_backup":None,"last_restore":None,"last_error":None,"size_mb":None}
 
-class LoginPayload(BaseModel):
-    username: str; password: str
+cpu_prev = None
+cpu_prev_time = None
 
-# ---------- Login/session protection ----------
-def auth_configured():
-    return bool(AUTH_USERNAME and AUTH_PASSWORD and AUTH_SECRET)
+# ------------------------------------------------------------
+# Models
+# ------------------------------------------------------------
 
-def make_session():
-    ts = str(int(time.time()))
-    nonce = secrets.token_urlsafe(24)
-    raw = ts + "." + nonce
-    sig = hmac.new(AUTH_SECRET.encode(), raw.encode(), hashlib.sha256).digest()
-    return raw + "." + base64.urlsafe_b64encode(sig).decode().rstrip("=")
+class NavigatePayload(BaseModel):
+    url: str
 
-def valid_session(token):
-    if not token or not auth_configured(): return False
+class TouchPayload(BaseModel):
+    x: float
+    y: float
+    action: Optional[str] = "click"
+    delta_x: float = 0
+    delta_y: float = 0
+
+class KeyPayload(BaseModel):
+    key: str
+
+class TypePayload(BaseModel):
+    text: str
+
+class SettingsPayload(BaseModel):
+    format: Optional[str] = None
+    quality: Optional[int] = None
+    interval: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    max_pixels: Optional[int] = None
+    auto_device_size: Optional[bool] = None
+    device_width: Optional[int] = None
+    device_height: Optional[int] = None
+
+# ------------------------------------------------------------
+# Authentication + Supabase profile backup
+# ------------------------------------------------------------
+
+def _auth_token():
+    user = AUTH_USERNAME.encode("utf-8")
+    sig = hmac.new(AUTH_SECRET.encode("utf-8"), user, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(user + b"." + sig).decode("ascii")
+
+def _valid_token(token):
+    if not token:
+        return False
+    return hmac.compare_digest(token, _auth_token())
+
+def _storage_url():
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    bucket = urllib.parse.quote(SUPABASE_BUCKET, safe="")
+    obj = "/".join(urllib.parse.quote(p, safe="") for p in SUPABASE_OBJECT.split("/"))
+    return f"{SUPABASE_URL}/storage/v1/object/{bucket}/{obj}"
+
+def _profile_has_data():
     try:
-        ts, nonce, sig = token.split(".", 2)
-        if abs(int(time.time()) - int(ts)) > SESSION_DAYS * 86400: return False
-        raw = ts + "." + nonce
-        expected = base64.urlsafe_b64encode(hmac.new(AUTH_SECRET.encode(), raw.encode(), hashlib.sha256).digest()).decode().rstrip("=")
-        return hmac.compare_digest(sig, expected)
+        return os.path.isdir(DATA_DIR) and any(True for _ in os.scandir(DATA_DIR))
     except Exception:
         return False
 
+def _supabase_download():
+    global last_backup_error, last_backup_status
+    url = _storage_url()
+    if not url:
+        last_backup_status = "cloud disabled"
+        return False
+    req = urllib_request.Request(url, headers={
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    })
+    try:
+        with urllib_request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+        if not data:
+            return False
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz") as tmp:
+            tmp.write(data)
+            archive = tmp.name
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with tarfile.open(archive, "r:gz") as tar:
+                tar.extractall(DATA_DIR)
+            last_backup_status = "restored from cloud"
+            last_backup_error = None
+            return True
+        finally:
+            try: os.unlink(archive)
+            except Exception: pass
+    except HTTPError as e:
+        # No object yet is normal on the first launch.
+        if e.code == 404:
+            last_backup_status = "no cloud backup yet"
+            last_backup_error = None
+        else:
+            last_backup_error = f"Supabase download HTTP {e.code}: {e.read().decode('utf-8','replace')}"
+        return False
+    except Exception as e:
+        last_backup_error = f"Supabase download: {e}"
+        return False
+
+def _make_profile_archive():
+    fd, archive = tempfile.mkstemp(suffix=".tar.gz")
+    os.close(fd)
+    with tarfile.open(archive, "w:gz") as tar:
+        if os.path.isdir(DATA_DIR):
+            for root, dirs, files in os.walk(DATA_DIR):
+                for name in files:
+                    # Chromium lock/socket files must not be restored.
+                    if name in {"SingletonLock", "SingletonSocket", "SingletonCookie"}:
+                        continue
+                    path = os.path.join(root, name)
+                    arc = os.path.relpath(path, DATA_DIR)
+                    try:
+                        tar.add(path, arcname=arc, recursive=False)
+                    except FileNotFoundError:
+                        pass
+    return archive
+
+def _supabase_upload_archive(archive):
+    global last_backup_time, last_backup_error, last_backup_status
+    url = _storage_url()
+    if not url:
+        last_backup_status = "cloud disabled"
+        return False
+    data = Path(archive).read_bytes()
+    req = urllib_request.Request(
+        url,
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Content-Type": "application/gzip",
+            "x-upsert": "true",
+        },
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=60) as resp:
+            resp.read()
+        last_backup_time = time.time()
+        last_backup_error = None
+        last_backup_status = "cloud backup complete"
+        return True
+    except HTTPError as e:
+        last_backup_error = f"Supabase upload HTTP {e.code}: {e.read().decode('utf-8','replace')}"
+        last_backup_status = "backup failed"
+        return False
+    except Exception as e:
+        last_backup_error = f"Supabase upload: {e}"
+        last_backup_status = "backup failed"
+        return False
+
+async def backup_profile():
+    # Never closes Chromium: backup is a filesystem snapshot while the browser stays alive.
+    if backup_lock.locked():
+        return False
+    async with backup_lock:
+        archive = None
+        try:
+            archive = await asyncio.to_thread(_make_profile_archive)
+            return await asyncio.to_thread(_supabase_upload_archive, archive)
+        finally:
+            if archive:
+                try: os.unlink(archive)
+                except Exception: pass
+
+async def backup_loop():
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL)
+        try:
+            await backup_profile()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
 @app.middleware("http")
-async def authentication_middleware(request: Request, call_next):
+async def auth_middleware(request: Request, call_next):
     path = request.url.path
-    public = path in {"/", "/login", "/logout", "/auth/status", "/favicon.ico"}
-    if not public and not valid_session(request.cookies.get("remote_session")):
-        return JSONResponse({"status":"error","message":"Authentication required"}, status_code=401)
+    public = {"/", "/login", "/auth/status", "/favicon.ico", "/health"}
+    if path not in public and not _valid_token(request.cookies.get(AUTH_COOKIE)):
+        return JSONResponse({"detail": "Authentication required"}, status_code=401)
     return await call_next(request)
 
-@app.post("/login")
-async def login(payload: LoginPayload):
-    if not auth_configured():
-        return JSONResponse({"status":"error","message":"Authentication is not configured. Set AUTH_USERNAME, AUTH_PASSWORD and AUTH_SECRET in Render."}, status_code=500)
-    if not (hmac.compare_digest(payload.username, AUTH_USERNAME) and hmac.compare_digest(payload.password, AUTH_PASSWORD)):
-        return JSONResponse({"status":"error","message":"Invalid username or password"}, status_code=401)
-    response = JSONResponse({"status":"success"})
-    response.set_cookie("remote_session", make_session(), max_age=SESSION_DAYS*86400, httponly=True, secure=True, samesite="lax", path="/")
-    return response
-
-@app.post("/logout")
-async def logout():
-    response = JSONResponse({"status":"success"})
-    response.delete_cookie("remote_session", path="/")
-    return response
-
-@app.get("/auth/status")
-async def auth_status(request: Request):
-    return {"authenticated": valid_session(request.cookies.get("remote_session")), "configured": auth_configured()}
-
-class NavigatePayload(BaseModel): url: str
-class TouchPayload(BaseModel):
-    x: float; y: float; action: Optional[str] = "click"; delta_x: float = 0; delta_y: float = 0
-class KeyPayload(BaseModel): key: str
-class TypePayload(BaseModel): text: str
-class SettingsPayload(BaseModel):
-    format: Optional[str]=None; quality: Optional[int]=None; interval: Optional[int]=None
-    width: Optional[int]=None; height: Optional[int]=None; max_pixels: Optional[int]=None; chromium_zoom: Optional[float]=None
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 
 def mark_screen_dirty(action="unknown"):
     global last_action
@@ -107,423 +280,964 @@ def mark_screen_dirty(action="unknown"):
 
 async def get_active_page():
     global pages, active_tab_index
-    pages = [p for p in pages if not p.is_closed()]
-    if not pages: return None
-    active_tab_index = min(active_tab_index, len(pages)-1)
+    if not pages:
+        return None
+    if active_tab_index >= len(pages):
+        active_tab_index = max(0, len(pages) - 1)
     return pages[active_tab_index]
 
-def sanitize_url(raw_input):
-    url=(raw_input or "").strip()
-    if not url: return "https://www.google.com"
-    if url.startswith(("http://","https://","about:")): return url
-    if "." in url and " " not in url: return "https://"+url
-    return "https://www.google.com/search?q="+urllib.parse.quote(url)
+def sanitize_url(raw_input: str) -> str:
+    url = (raw_input or "").strip()
 
-def clamp_int(v,a,b): return max(a,min(b,int(v)))
-def current_viewport(): return {"width":stream_settings["width"],"height":stream_settings["height"]}
+    if not url:
+        return "https://www.google.com"
 
-async def apply_chromium_zoom(page):
-    try:
-        cdp = await context.new_cdp_session(page)
-        await cdp.send("Emulation.setPageScaleFactor", {"pageScaleFactor": float(stream_settings.get("chromium_zoom",1.0))})
-        await cdp.detach()
-    except Exception:
-        pass
+    if url.startswith(("http://", "https://", "about:")):
+        return url
 
-async def apply_zoom_all():
-    for pg in list(pages):
-        try:
-            if not pg.is_closed(): await apply_chromium_zoom(pg)
-        except Exception: pass
+    if "." in url and " " not in url:
+        return "https://" + url
+
+    return "https://www.google.com/search?q=" + urllib.parse.quote(url)
+
+def clamp_int(value, minimum, maximum):
+    return max(minimum, min(maximum, int(value)))
+
+def current_viewport():
+    if stream_settings.get("auto_device_size", True):
+        return {
+            "width": clamp_int(stream_settings.get("device_width", 360), 280, 1280),
+            "height": clamp_int(stream_settings.get("device_height", 740), 400, 1600),
+        }
+    return {
+        "width": stream_settings["width"],
+        "height": stream_settings["height"],
+    }
+
 def cgroup_value(path):
     try:
-        with open(path,encoding="utf-8") as f:return f.read().strip()
-    except:return None
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return None
 
 def get_memory_stats():
-    cur=cgroup_value("/sys/fs/cgroup/memory.current"); mx=cgroup_value("/sys/fs/cgroup/memory.max")
-    if cur is not None:
+    # Linux cgroup v2 first.
+    current = cgroup_value("/sys/fs/cgroup/memory.current")
+    maximum = cgroup_value("/sys/fs/cgroup/memory.max")
+
+    if current is not None:
         try:
-            cb=int(cur); mb=int(mx) if mx and mx!="max" else 0
-            return {"used_mb":round(cb/1048576,1),"limit_mb":round(mb/1048576,1) if mb else None}
-        except: pass
+            current_b = int(current)
+            if maximum and maximum != "max":
+                max_b = int(maximum)
+            else:
+                max_b = 0
+            return {
+                "used_mb": round(current_b / 1024 / 1024, 1),
+                "limit_mb": round(max_b / 1024 / 1024, 1) if max_b else None,
+            }
+        except Exception:
+            pass
+
+    # Fallback: /proc.
     try:
-        info={}
-        with open("/proc/meminfo",encoding="utf-8") as f:
+        info = {}
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
             for line in f:
-                p=line.split();
-                if len(p)>=2: info[p[0].rstrip(":")]=int(p[1])*1024
-        total=info.get("MemTotal",0); avail=info.get("MemAvailable",0)
-        return {"used_mb":round(max(0,total-avail)/1048576,1),"limit_mb":round(total/1048576,1) if total else None}
-    except:return {"used_mb":None,"limit_mb":None}
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1]) * 1024
+
+        total = info.get("MemTotal", 0)
+        available = info.get("MemAvailable", 0)
+        used = max(0, total - available)
+
+        return {
+            "used_mb": round(used / 1024 / 1024, 1),
+            "limit_mb": round(total / 1024 / 1024, 1) if total else None,
+        }
+    except Exception:
+        return {"used_mb": None, "limit_mb": None}
 
 def get_cgroup_cpu_percent():
-    global cpu_prev,cpu_prev_time
-    stat=cgroup_value("/sys/fs/cgroup/cpu.stat")
-    if not stat:return None
-    usage=None
+    global cpu_prev, cpu_prev_time
+
+    stat = cgroup_value("/sys/fs/cgroup/cpu.stat")
+    if not stat:
+        return None
+
+    usage_usec = None
     for line in stat.splitlines():
-        p=line.split()
-        if len(p)==2 and p[0]=="usage_usec": usage=int(p[1]);break
-    if usage is None:return None
-    now=time.monotonic()
-    if cpu_prev is None: cpu_prev,cpu_prev_time=usage,now;return 0.0
-    elapsed=now-cpu_prev_time; delta=(usage-cpu_prev)/1e6;cpu_prev,cpu_prev_time=usage,now
-    return round(max(0,min(999,(delta/elapsed)*100)),1) if elapsed>0 else 0.0
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "usage_usec":
+            usage_usec = int(parts[1])
+            break
+
+    if usage_usec is None:
+        return None
+
+    now = time.monotonic()
+
+    if cpu_prev is None:
+        cpu_prev = usage_usec
+        cpu_prev_time = now
+        return 0.0
+
+    elapsed = now - cpu_prev_time
+    delta_cpu = (usage_usec - cpu_prev) / 1_000_000
+
+    cpu_prev = usage_usec
+    cpu_prev_time = now
+
+    if elapsed <= 0:
+        return 0.0
+
+    # 100% means one full CPU core.
+    return round(max(0.0, min(999.0, (delta_cpu / elapsed) * 100)), 1)
 
 def get_process_memory():
     try:
-        with open("/proc/self/statm") as f:p=int(f.read().split()[1])
-        return round(p*os.sysconf("SC_PAGE_SIZE")/1048576,1)
-    except:return None
+        with open("/proc/self/statm", "r", encoding="utf-8") as f:
+            pages = int(f.read().split()[1])
+        return round(pages * os.sysconf("SC_PAGE_SIZE") / 1024 / 1024, 1)
+    except Exception:
+        return None
 
 async def browser_memory_estimate():
-    total=0.0
+    # Add RSS of Chromium processes when /proc is available.
+    total = 0.0
+
     try:
-        for n in os.listdir("/proc"):
-            if not n.isdigit():continue
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+
+            cmd_path = f"/proc/{name}/cmdline"
+            statm_path = f"/proc/{name}/statm"
+
             try:
-                with open(f"/proc/{n}/cmdline","rb") as f: cmd=f.read().decode("utf-8","ignore").lower()
-                if "chrom" not in cmd:continue
-                with open(f"/proc/{n}/statm") as f:r=int(f.read().split()[1])
-                total+=r*os.sysconf("SC_PAGE_SIZE")/1048576
-            except:pass
-    except:pass
-    return round(total,1)
+                with open(cmd_path, "rb") as f:
+                    cmd = f.read().decode("utf-8", "ignore").lower()
+
+                if "chrom" not in cmd:
+                    continue
+
+                with open(statm_path, "r", encoding="utf-8") as f:
+                    rss_pages = int(f.read().split()[1])
+
+                total += rss_pages * os.sysconf("SC_PAGE_SIZE") / 1024 / 1024
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return round(total, 1)
 
 async def build_stats():
-    now=time.monotonic(); recent=[t for t in frame_times if now-t<=2]
-    fps=round((len(recent)-1)/max(.001,recent[-1]-recent[0]),1) if len(recent)>=2 else 0.0
-    mem=get_memory_stats()
-    return {"server_fps":fps,"frame_bytes":last_frame_bytes,"frame_kb":round(last_frame_bytes/1024,1),"encode_ms":round(last_encode_ms,1),"ram_mb":mem["used_mb"],"ram_limit_mb":mem["limit_mb"],"python_ram_mb":get_process_memory(),"chromium_ram_mb":await browser_memory_estimate(),"cpu_percent":get_cgroup_cpu_percent(),"tabs":len(pages),"active_tab":active_tab_index,"viewport":current_viewport(),"format":stream_settings["format"],"quality":stream_settings["quality"],"interval":stream_settings["interval"],"last_action":last_action,"storage_path":DATA_DIR}
+    now = time.monotonic()
 
-# ---------- Supabase Storage via REST API (no new Python package required) ----------
-def supabase_headers():
-    if not SUPABASE_URL or not SUPABASE_SECRET_KEY: raise RuntimeError("Supabase is not configured")
-    return {"Authorization":"Bearer "+SUPABASE_SECRET_KEY,"apikey":SUPABASE_SECRET_KEY}
+    # Server stream FPS over the latest ~2 seconds.
+    recent = [t for t in frame_times if now - t <= 2.0]
+    if len(recent) >= 2:
+        span = max(0.001, recent[-1] - recent[0])
+        fps = round((len(recent) - 1) / span, 1)
+    else:
+        fps = 0.0
 
-def supabase_upload(path):
-    with open(path,"rb") as f:data=f.read()
-    url=f"{SUPABASE_URL}/storage/v1/object/{urllib.parse.quote(SUPABASE_BUCKET,safe='')}/{urllib.parse.quote(SUPABASE_BACKUP_PATH,safe='/')}"
-    req=urllib.request.Request(url,data=data,method="POST",headers={**supabase_headers(),"Content-Type":"application/gzip","x-upsert":"true"})
-    try:
-        with urllib.request.urlopen(req,timeout=120) as r:r.read()
-    except urllib.error.HTTPError as e:
-        body=e.read().decode("utf-8","ignore")
-        if e.code not in (409,): raise RuntimeError(f"Supabase upload HTTP {e.code}: {body[:300]}")
-        # Some gateways ignore x-upsert; use PUT for replacement.
-        req=urllib.request.Request(url,data=data,method="PUT",headers={**supabase_headers(),"Content-Type":"application/gzip"})
-        with urllib.request.urlopen(req,timeout=120) as r:r.read()
-    return len(data)
+    mem = get_memory_stats()
+    browser_mem = await browser_memory_estimate()
+    cpu = get_cgroup_cpu_percent()
 
-def supabase_download(path):
-    url=f"{SUPABASE_URL}/storage/v1/object/{urllib.parse.quote(SUPABASE_BUCKET,safe='')}/{urllib.parse.quote(SUPABASE_BACKUP_PATH,safe='/')}"
-    req=urllib.request.Request(url,method="GET",headers=supabase_headers())
-    try:
-        with urllib.request.urlopen(req,timeout=120) as r:data=r.read()
-    except urllib.error.HTTPError as e: raise RuntimeError(f"Supabase download HTTP {e.code}: {e.read().decode('utf-8','ignore')[:300]}")
-    with open(path,"wb") as f:f.write(data)
-    return len(data)
+    return {
+        "server_fps": fps,
+        "frame_bytes": last_frame_bytes,
+        "frame_kb": round(last_frame_bytes / 1024, 1),
+        "encode_ms": round(last_encode_ms, 1),
+        "ram_mb": mem["used_mb"],
+        "ram_limit_mb": mem["limit_mb"],
+        "python_ram_mb": get_process_memory(),
+        "chromium_ram_mb": browser_mem,
+        "cpu_percent": cpu,
+        "tabs": len(pages),
+        "active_tab": active_tab_index,
+        "viewport": current_viewport(),
+        "format": stream_settings["format"],
+        "quality": stream_settings["quality"],
+        "interval": stream_settings["interval"],
+        "last_action": last_action,
+        "storage_path": DATA_DIR,
+    }
 
-def make_archive():
-    os.makedirs(DATA_DIR,exist_ok=True)
-    fd,path=tempfile.mkstemp(suffix=".tar.gz");os.close(fd)
-    skip_dirs={"Cache","Code Cache","GPUCache","ShaderCache","GrShaderCache"}
-    skip_files={"SingletonCookie","SingletonLock","SingletonSocket","DevToolsActivePort"}
-    with tarfile.open(path,"w:gz",compresslevel=6) as tar:
-        base=os.path.abspath(DATA_DIR)
-        for root,dirs,files in os.walk(base):
-            dirs[:]=[d for d in dirs if d not in skip_dirs]
-            for name in files:
-                if name in skip_files:continue
-                full=os.path.join(root,name)
-                try:tar.add(full,arcname=os.path.relpath(full,base),recursive=False)
-                except:pass
-    return path
-
-def backup_worker():
-    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:return
-    if not backup_lock.acquire(blocking=False):return
-    backup_status["busy"]=True;backup_status["last_error"]=None;temp=None
-    try:
-        temp=make_archive();size=os.path.getsize(temp)
-        if size>50*1024*1024:raise RuntimeError(f"Backup is {size/1048576:.1f} MB; Supabase Free individual-file limit is 50 MB.")
-        n=supabase_upload(temp);backup_status["last_backup"]=time.strftime("%Y-%m-%d %H:%M:%S UTC",time.gmtime());backup_status["size_mb"]=round(n/1048576,2)
-    except Exception as e:backup_status["last_error"]=str(e)
-    finally:
-        if temp:
-            try:os.remove(temp)
-            except:pass
-        backup_status["busy"]=False;backup_lock.release()
-
-async def start_browser_context():
-    global context,pages,active_tab_index
-    context=await playwright_instance.chromium.launch_persistent_context(user_data_dir=DATA_DIR,headless=True,viewport=current_viewport(),device_scale_factor=1,is_mobile=False,has_touch=False,user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-blink-features=AutomationControlled","--disable-background-networking","--disable-background-timer-throttling","--disable-renderer-backgrounding","--disable-features=Translate,MediaRouter","--no-first-run","--no-default-browser-check"])
-    await context.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-    pages=context.pages
-    if not pages:
-        p=await context.new_page()
-        try:await p.goto("https://www.google.com",wait_until="commit",timeout=15000)
-        except:pass
-        pages.append(p)
-    active_tab_index=0
-    await apply_zoom_all()
-    mark_screen_dirty("browser-started")
-
-async def restore_profile():
-    global context,pages,active_tab_index
-    if context:
-        try:await context.close()
-        except:pass
-        context=None
-    pages=[];active_tab_index=0
-    fd,archive=tempfile.mkstemp(suffix=".tar.gz");os.close(fd);extract=DATA_DIR+".restore";old=DATA_DIR+".old"
-    try:
-        await asyncio.get_running_loop().run_in_executor(None,supabase_download,archive)
-        if os.path.exists(extract):shutil.rmtree(extract,ignore_errors=True)
-        os.makedirs(extract,exist_ok=True)
-        with tarfile.open(archive,"r:gz") as tar:tar.extractall(extract)
-        if os.path.exists(old):shutil.rmtree(old,ignore_errors=True)
-        if os.path.exists(DATA_DIR):os.replace(DATA_DIR,old)
-        os.replace(extract,DATA_DIR);shutil.rmtree(old,ignore_errors=True)
-        await start_browser_context();backup_status["last_restore"]=time.strftime("%Y-%m-%d %H:%M:%S UTC",time.gmtime())
-    finally:
-        try:os.remove(archive)
-        except:pass
-        if os.path.exists(extract):shutil.rmtree(extract,ignore_errors=True)
+# ------------------------------------------------------------
+# Startup / shutdown
+# ------------------------------------------------------------
 
 @app.on_event("startup")
 async def startup_event():
-    global playwright_instance
-    os.makedirs(DATA_DIR,exist_ok=True)
-    playwright_instance=await async_playwright().start()
-    await start_browser_context()
-    if AUTO_BACKUP_MINUTES>0:
-        asyncio.create_task(auto_backup_loop())
+    global playwright_instance, context, pages, active_tab_index
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not _profile_has_data():
+        await asyncio.to_thread(_supabase_download)
+
+    playwright_instance = await async_playwright().start()
+
+    # Persistent Chromium profile.
+    # Cookies/localStorage/session data are stored here.
+    context = await playwright_instance.chromium.launch_persistent_context(
+        user_data_dir=DATA_DIR,
+        headless=True,
+        viewport=current_viewport(),
+        device_scale_factor=1,
+        is_mobile=False,
+        has_touch=False,
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-features=Translate,MediaRouter",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ],
+    )
+
+    await context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+    """)
+
+    pages = context.pages
+
+    if not pages:
+        initial_page = await context.new_page()
+        try:
+            await initial_page.goto(
+                "https://www.google.com",
+                wait_until="commit",
+                timeout=15000
+            )
+        except Exception:
+            pass
+        pages.append(initial_page)
+
+    active_tab_index = 0
+    global backup_task
+    backup_task = asyncio.create_task(backup_loop())
+    mark_screen_dirty("startup")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global playwright_instance,context
-    try:
-        if context:await context.close()
-    finally:
-        if playwright_instance:await playwright_instance.stop()
+    global playwright_instance, context, backup_task
 
-async def auto_backup_loop():
-    await asyncio.sleep(120)
-    while True:
+    try:
+        if backup_task:
+            backup_task.cancel()
+            try:
+                await backup_task
+            except asyncio.CancelledError:
+                pass
+        # Final snapshot before shutdown, without restarting Chromium.
         try:
-            if not backup_status["busy"] and backup_status["configured"]:await asyncio.get_running_loop().run_in_executor(None,backup_worker)
-        except:pass
-        await asyncio.sleep(max(60,AUTO_BACKUP_MINUTES*60))
+            await backup_profile()
+        except Exception:
+            pass
+        if context:
+            await context.close()
+    finally:
+        if playwright_instance:
+            await playwright_instance.stop()
 
-@app.get("/",response_class=HTMLResponse)
-async def root():
-    p=os.path.join(os.path.dirname(os.path.abspath(__file__)),"index.html")
-    return FileResponse(p) if os.path.exists(p) else HTMLResponse("<h2>Error: index.html not found</h2>",404)
+# ------------------------------------------------------------
+# Basic routes
+# ------------------------------------------------------------
+
+
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+@app.get("/auth/status")
+async def auth_status(request: Request):
+    return {"authenticated": _valid_token(request.cookies.get(AUTH_COOKIE))}
+
+@app.post("/login")
+async def login(payload: LoginPayload, response: Response):
+    if not (
+        hmac.compare_digest(payload.username, AUTH_USERNAME) and
+        hmac.compare_digest(payload.password, AUTH_PASSWORD)
+    ):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    response.set_cookie(
+        AUTH_COOKIE, _auth_token(),
+        httponly=True, secure=True, samesite="lax", max_age=60*60*24*30, path="/"
+    )
+    return {"status": "success"}
+
+@app.post("/logout")
+async def logout(response: Response):
+    response.delete_cookie(AUTH_COOKIE, path="/")
+    return {"status": "success"}
+
+@app.get("/backup/status")
+async def backup_status():
+    return {
+        "status": last_backup_status,
+        "last_backup": last_backup_time,
+        "error": last_backup_error,
+        "cloud_enabled": bool(_storage_url()),
+        "bucket": SUPABASE_BUCKET,
+        "object": SUPABASE_OBJECT,
+    }
+
+@app.post("/backup/now")
+async def backup_now():
+    ok = await backup_profile()
+    return {
+        "status": "success" if ok else "error",
+        "message": last_backup_status,
+        "last_backup": last_backup_time,
+        "error": last_backup_error,
+    }
+
+@app.get("/", response_class=HTMLResponse)
+async def read_root():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    html_path = os.path.join(base_dir, "index.html")
+
+    if os.path.exists(html_path):
+        return FileResponse(html_path)
+
+    return HTMLResponse(
+        "<h2>Error: index.html not found</h2>",
+        status_code=404
+    )
+
 @app.get("/health")
-async def health():return {"status":"online","browser":"chromium","tabs":len(pages),"persistent_profile":True,"supabase_configured":backup_status["configured"]}
-@app.get("/settings")
-async def settings():return {"settings":stream_settings,"viewport":current_viewport()}
-@app.post("/settings")
-async def update_settings(p:SettingsPayload):
-    if p.format in {"png","jpeg","webp"}:stream_settings["format"]=p.format
-    if p.quality is not None:stream_settings["quality"]=clamp_int(p.quality,10,100)
-    if p.interval is not None:stream_settings["interval"]=clamp_int(p.interval,30,2000)
-    if p.width is not None:stream_settings["width"]=clamp_int(p.width,320,1280)
-    if p.height is not None:stream_settings["height"]=clamp_int(p.height,240,900)
-    if p.max_pixels is not None:stream_settings["max_pixels"]=clamp_int(p.max_pixels,100000,2000000)
-    if p.chromium_zoom is not None:stream_settings["chromium_zoom"]=max(0.25,min(2.0,float(p.chromium_zoom)))
-    try:
-        if context:
-            await context.set_viewport_size(current_viewport())
-            await apply_zoom_all()
-    except:pass
-    mark_screen_dirty("settings");return {"status":"success","settings":stream_settings,"viewport":current_viewport()}
+async def health():
+    return {
+        "status": "online",
+        "browser": "chromium",
+        "tabs": len(pages),
+        "persistent_profile": True,
+        "storage_path": DATA_DIR,
+    }
 
-@app.post("/device")
-async def device_size(p: SettingsPayload):
-    if p.width is not None: stream_settings["width"] = clamp_int(p.width, 280, 1280)
-    if p.height is not None: stream_settings["height"] = clamp_int(p.height, 480, 1600)
-    try:
-        if context:
-            await context.set_viewport_size(current_viewport())
-            await apply_zoom_all()
-    except Exception: pass
-    mark_screen_dirty("device-resize")
-    return {"status":"success","viewport":current_viewport()}
+@app.get("/settings")
+async def get_settings():
+    return {
+        "settings": stream_settings,
+        "viewport": current_viewport(),
+    }
+
+@app.post("/settings")
+async def update_settings(payload: SettingsPayload):
+    allowed_formats = {"png", "jpeg", "webp"}
+
+    if payload.format is not None:
+        fmt = payload.format.lower()
+        if fmt in allowed_formats:
+            stream_settings["format"] = fmt
+
+    if payload.quality is not None:
+        stream_settings["quality"] = clamp_int(payload.quality, 10, 100)
+
+    if payload.interval is not None:
+        stream_settings["interval"] = clamp_int(payload.interval, 30, 2000)
+
+    if payload.width is not None:
+        stream_settings["width"] = clamp_int(payload.width, 320, 1280)
+
+    if payload.height is not None:
+        stream_settings["height"] = clamp_int(payload.height, 240, 900)
+
+    if payload.max_pixels is not None:
+        stream_settings["max_pixels"] = clamp_int(
+            payload.max_pixels, 100000, 2_000_000
+        )
+    if payload.auto_device_size is not None:
+        stream_settings["auto_device_size"] = bool(payload.auto_device_size)
+    if payload.device_width is not None:
+        stream_settings["device_width"] = clamp_int(payload.device_width, 280, 1280)
+    if payload.device_height is not None:
+        stream_settings["device_height"] = clamp_int(payload.device_height, 400, 1600)
+
+    if context:
+        try:
+            await context.set_viewport_size(
+                current_viewport()
+            )
+        except Exception:
+            pass
+
+    mark_screen_dirty("settings")
+
+    return {
+        "status": "success",
+        "settings": stream_settings,
+        "viewport": current_viewport(),
+    }
+
+# ------------------------------------------------------------
+# Screen streaming
+# ------------------------------------------------------------
 
 async def capture_frame(page):
-    global last_frame,last_encode_ms,last_frame_bytes
-    start=time.perf_counter();fmt=stream_settings["format"];q=stream_settings["quality"]
+    global last_frame, last_encode_ms, last_frame_bytes
+
+    fmt = stream_settings["format"]
+    quality = stream_settings["quality"]
+
+    started = time.perf_counter()
+
     try:
-        if fmt=="jpeg":data=await page.screenshot(type="jpeg",quality=q,animations="allow",scale="css")
-        elif fmt=="webp":
-            try:data=await page.screenshot(type="webp",quality=q,animations="allow",scale="css")
-            except:data=await page.screenshot(type="png",animations="allow",scale="css")
-        else:data=await page.screenshot(type="png",animations="allow",scale="css")
-        last_encode_ms=(time.perf_counter()-start)*1000;last_frame_bytes=len(data);last_frame=data;frame_times.append(time.monotonic());return data
-    except:return None
+        # Do not disable animations here. That can make live pages/videos
+        # behave strangely and was a source of bad visual behavior.
+        if fmt == "jpeg":
+            data = await page.screenshot(
+                type="jpeg",
+                quality=quality,
+                animations="allow",
+                scale="css",
+            )
+        elif fmt == "webp":
+            # Chromium/Playwright versions differ on WebP screenshot support.
+            # Try WebP first; fall back to PNG if unsupported.
+            try:
+                data = await page.screenshot(
+                    type="webp",
+                    quality=quality,
+                    animations="allow",
+                    scale="css",
+                )
+            except Exception:
+                data = await page.screenshot(
+                    type="png",
+                    animations="allow",
+                    scale="css",
+                )
+        else:
+            data = await page.screenshot(
+                type="png",
+                animations="allow",
+                scale="css",
+            )
+
+        last_encode_ms = (time.perf_counter() - started) * 1000
+        last_frame_bytes = len(data)
+        last_frame = data
+        frame_times.append(time.monotonic())
+
+        return data
+
+    except Exception:
+        return None
 
 async def frame_generator():
     global last_frame
+
     while True:
-        page=await get_active_page()
+        page = await get_active_page()
+
         if page:
-            data=await capture_frame(page)
-            if not data:data=last_frame
-            if data:
-                c={"png":"image/png","jpeg":"image/jpeg","webp":"image/webp"}.get(stream_settings["format"],"image/png")
-                yield b"--frame\r\n"+f"Content-Type: {c}\r\nContent-Length: {len(data)}\r\n\r\n".encode()+data+b"\r\n"
-        try:await asyncio.wait_for(screen_event.wait(),timeout=max(.03,stream_settings["interval"]/1000));screen_event.clear()
-        except asyncio.TimeoutError:pass
+            try:
+                data = await capture_frame(page)
+
+                if data:
+                    content_type = {
+                        "png": "image/png",
+                        "jpeg": "image/jpeg",
+                        "webp": "image/webp",
+                    }.get(stream_settings["format"], "image/png")
+
+                    yield (
+                        b"--frame\r\n"
+                        + f"Content-Type: {content_type}\r\n".encode()
+                        + f"Content-Length: {len(data)}\r\n\r\n".encode()
+                        + data
+                        + b"\r\n"
+                    )
+            except Exception:
+                pass
+
+        # Wake immediately after user interaction/settings, otherwise
+        # respect the selected stream interval.
+        try:
+            await asyncio.wait_for(
+                screen_event.wait(),
+                timeout=max(0.03, stream_settings["interval"] / 1000)
+            )
+            screen_event.clear()
+        except asyncio.TimeoutError:
+            pass
 
 @app.get("/screen")
-async def screen():return StreamingResponse(frame_generator(),media_type="multipart/x-mixed-replace; boundary=frame",headers={"Cache-Control":"no-cache, no-store, must-revalidate","Pragma":"no-cache","Connection":"keep-alive"})
+async def stream_screen():
+    return StreamingResponse(
+        frame_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+# ------------------------------------------------------------
+# Navigation
+# ------------------------------------------------------------
 
 @app.post("/navigate")
-async def navigate(p:NavigatePayload):
-    page=await get_active_page()
-    if not page:return {"status":"error","message":"No active page"}
+async def navigate(payload: NavigatePayload):
+    page = await get_active_page()
+
+    if not page:
+        return {"status": "error", "message": "No active page"}
+
+    target_url = sanitize_url(payload.url)
+
     try:
-        async with page_lock:await page.goto(sanitize_url(p.url),wait_until="commit",timeout=20000)
-        mark_screen_dirty("navigate");return {"status":"success","url":page.url}
-    except Exception as e:return {"status":"error","message":str(e),"url":page.url}
+        async with page_lock:
+            await page.goto(
+                target_url,
+                wait_until="commit",
+                timeout=20000
+            )
+
+        mark_screen_dirty("navigate")
+
+        return {
+            "status": "success",
+            "url": page.url,
+        }
+
+    except Exception as e:
+        mark_screen_dirty("navigate-error")
+        return {
+            "status": "error",
+            "message": str(e),
+            "url": page.url,
+        }
+
 @app.post("/history/back")
-async def back():
-    page=await get_active_page()
+async def history_back():
+    page = await get_active_page()
+
+    if not page:
+        return {"status": "error"}
+
     try:
-        async with page_lock:await page.go_back(wait_until="commit",timeout=10000)
-        mark_screen_dirty("back");return {"status":"success","url":page.url}
-    except Exception as e:return {"status":"error","message":str(e) if e else "No history","url":page.url if page else ""}
+        async with page_lock:
+            await page.go_back(
+                wait_until="commit",
+                timeout=10000
+            )
+
+        mark_screen_dirty("back")
+        return {"status": "success", "url": page.url}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e), "url": page.url}
+
 @app.post("/history/forward")
-async def forward():
-    page=await get_active_page()
+async def history_forward():
+    page = await get_active_page()
+
+    if not page:
+        return {"status": "error"}
+
     try:
-        async with page_lock:await page.go_forward(wait_until="commit",timeout=10000)
-        mark_screen_dirty("forward");return {"status":"success","url":page.url}
-    except Exception as e:return {"status":"error","message":str(e) if e else "No history","url":page.url if page else ""}
+        async with page_lock:
+            await page.go_forward(
+                wait_until="commit",
+                timeout=10000
+            )
+
+        mark_screen_dirty("forward")
+        return {"status": "success", "url": page.url}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e), "url": page.url}
+
 @app.post("/reload")
 async def reload_page():
-    page=await get_active_page()
+    page = await get_active_page()
+
+    if not page:
+        return {"status": "error"}
+
     try:
-        async with page_lock:await page.reload(wait_until="commit",timeout=15000)
-        mark_screen_dirty("reload");return {"status":"success","url":page.url}
-    except Exception as e:return {"status":"error","message":str(e),"url":page.url if page else ""}
+        async with page_lock:
+            await page.reload(
+                wait_until="commit",
+                timeout=15000
+            )
+
+        mark_screen_dirty("reload")
+        return {"status": "success", "url": page.url}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e), "url": page.url}
+
 @app.post("/stop")
-async def stop():
-    page=await get_active_page()
-    try:await page.evaluate("window.stop()");mark_screen_dirty("stop");return {"status":"success"}
-    except Exception as e:return {"status":"error","message":str(e)}
+async def stop_page():
+    page = await get_active_page()
+
+    if not page:
+        return {"status": "error"}
+
+    try:
+        await page.evaluate("window.stop()")
+        mark_screen_dirty("stop")
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 @app.post("/home")
-async def home():return await navigate(NavigatePayload(url="https://www.google.com"))
+async def home():
+    return await navigate(NavigatePayload(url="https://www.google.com"))
+
+# ------------------------------------------------------------
+# Tabs
+# ------------------------------------------------------------
 
 @app.get("/tabs")
-async def tabs_route():
-    data=[]
-    for i,p in enumerate(pages):
+async def get_tabs():
+    global pages, active_tab_index
+
+    tabs_data = []
+
+    for idx, p in enumerate(pages):
         try:
-            if p.is_closed():continue
-            data.append({"id":i,"title":await p.title() or "New Tab","url":p.url})
-        except:data.append({"id":i,"title":"New Tab","url":"about:blank"})
-    return {"tabs":data,"active_index":active_tab_index}
+            title = await p.title()
+            url = p.url
+
+            tabs_data.append({
+                "id": idx,
+                "title": title or "New Tab",
+                "url": url,
+            })
+
+        except Exception:
+            tabs_data.append({
+                "id": idx,
+                "title": "New Tab",
+                "url": "about:blank",
+            })
+
+    return {
+        "tabs": tabs_data,
+        "active_index": active_tab_index,
+    }
+
 @app.post("/tabs/new")
 async def new_tab():
-    global active_tab_index
-    if len(pages)>=MAX_TABS:return {"status":"error","message":f"Maximum {MAX_TABS} tabs allowed"}
+    global pages, active_tab_index
+
+    if len(pages) >= MAX_TABS:
+        return {
+            "status": "error",
+            "message": f"Maximum {MAX_TABS} tabs allowed"
+        }
+
     try:
-        p=await context.new_page();pages.append(p);active_tab_index=len(pages)-1;await apply_chromium_zoom(p);asyncio.create_task(background_home(p));mark_screen_dirty("new-tab");return await tabs_route()
-    except Exception as e:return {"status":"error","message":str(e)}
-async def background_home(p):
-    try:await p.goto("https://www.google.com",wait_until="commit",timeout=15000)
-    except:pass
+        # Do not wait for Google to finish loading.
+        # This makes the new-tab action much faster.
+        new_page = await context.new_page()
+        pages.append(new_page)
+        active_tab_index = len(pages) - 1
+
+        asyncio.create_task(
+            background_open_home(new_page)
+        )
+
+        mark_screen_dirty("new-tab")
+        return await get_tabs()
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+async def background_open_home(page):
+    try:
+        await page.goto(
+            "https://www.google.com",
+            wait_until="commit",
+            timeout=15000
+        )
+    except Exception:
+        pass
     mark_screen_dirty("new-tab-loaded")
+
 @app.post("/tabs/switch")
-async def switch_tab(payload:dict):
-    global active_tab_index
-    i=int(payload.get("index",0))
-    if 0<=i<len(pages):
-        active_tab_index=i
-        try:await pages[i].bring_to_front()
-        except:pass
+async def switch_tab(payload: dict):
+    global active_tab_index, pages
+
+    idx = int(payload.get("index", 0))
+
+    if 0 <= idx < len(pages):
+        active_tab_index = idx
+
+        try:
+            await pages[idx].bring_to_front()
+        except Exception:
+            pass
+
         mark_screen_dirty("switch-tab")
-    return await tabs_route()
+
+    return await get_tabs()
+
 @app.post("/tabs/close")
-async def close_tab(payload:dict):
-    global active_tab_index,pages
-    i=int(payload.get("index",0))
-    if len(pages)>1 and 0<=i<len(pages):
-        try:await pages[i].close()
-        except:pass
-        pages.pop(i);active_tab_index=min(active_tab_index,len(pages)-1);mark_screen_dirty("close-tab")
-    return await tabs_route()
+async def close_tab(payload: dict):
+    global pages, active_tab_index
+
+    idx = int(payload.get("index", 0))
+
+    if len(pages) <= 1:
+        return await get_tabs()
+
+    if 0 <= idx < len(pages):
+        p = pages.pop(idx)
+
+        try:
+            await p.close()
+        except Exception:
+            pass
+
+        if idx < active_tab_index:
+            active_tab_index -= 1
+        elif active_tab_index >= len(pages):
+            active_tab_index = len(pages) - 1
+
+        mark_screen_dirty("close-tab")
+
+    return await get_tabs()
+
+# ------------------------------------------------------------
+# Touch / mouse
+# ------------------------------------------------------------
 
 @app.post("/touch")
-async def touch(p:TouchPayload):
-    page=await get_active_page()
-    if not page:return {"status":"error"}
+async def handle_touch(payload: TouchPayload):
+    page = await get_active_page()
+
+    if not page:
+        return {"status": "error"}
+
     try:
-        x=max(0,min(float(p.x),stream_settings["width"]-1));y=max(0,min(float(p.y),stream_settings["height"]-1))
+        vw = stream_settings["width"]
+        vh = stream_settings["height"]
+
+        x = max(0, min(float(payload.x), vw - 1))
+        y = max(0, min(float(payload.y), vh - 1))
+
         async with page_lock:
-            if p.action=="click":await page.mouse.click(x,y,delay=30)
-            elif p.action=="right_click":await page.mouse.click(x,y,button="right",delay=30)
-            elif p.action=="double_click":await page.mouse.dblclick(x,y,delay=30)
-            elif p.action=="scroll":await page.mouse.wheel(max(-1200,min(1200,p.delta_x)),max(-1600,min(1600,p.delta_y)))
-            elif p.action=="move":await page.mouse.move(x,y)
-        mark_screen_dirty(p.action or "touch");return {"status":"success"}
-    except Exception as e:return {"status":"error","message":str(e)}
+            if payload.action == "click":
+                await page.mouse.click(x, y, delay=30)
+
+            elif payload.action == "right_click":
+                await page.mouse.click(
+                    x, y,
+                    button="right",
+                    delay=30
+                )
+
+            elif payload.action == "double_click":
+                await page.mouse.dblclick(
+                    x, y,
+                    delay=30
+                )
+
+            elif payload.action == "scroll":
+                dx = max(-1200, min(1200, payload.delta_x))
+                dy = max(-1600, min(1600, payload.delta_y))
+                await page.mouse.wheel(dx, dy)
+
+            elif payload.action == "move":
+                await page.mouse.move(x, y)
+
+        mark_screen_dirty(payload.action or "touch")
+
+        return {"status": "success"}
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+        }
+
+# ------------------------------------------------------------
+# Exact text input
+# ------------------------------------------------------------
+
 @app.post("/type")
-async def type_text(p:TypePayload):
-    page=await get_active_page()
-    try:await page.keyboard.insert_text(p.text);mark_screen_dirty("type");return {"status":"success","length":len(p.text)}
-    except Exception as e:return {"status":"error","message":str(e)}
+async def type_text(payload: TypePayload):
+    page = await get_active_page()
+
+    if not page:
+        return {"status": "error"}
+
+    try:
+        # insert_text sends the whole string as text instead of generating
+        # one HTTP request per character. This prevents fast typing loss.
+        await page.keyboard.insert_text(payload.text)
+
+        mark_screen_dirty("type")
+
+        return {
+            "status": "success",
+            "length": len(payload.text),
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+        }
+
 @app.post("/key")
-async def key(p:KeyPayload):
-    page=await get_active_page()
-    try:await page.keyboard.press(p.key);mark_screen_dirty("key");return {"status":"success"}
-    except Exception as e:return {"status":"error","message":str(e)}
+async def handle_key(payload: KeyPayload):
+    page = await get_active_page()
 
-async def selected_text(page):
-    return await page.evaluate("""()=>{const e=document.activeElement;if(e&&typeof e.selectionStart==='number'&&typeof e.selectionEnd==='number')return String(e.value||'').substring(e.selectionStart,e.selectionEnd);const s=window.getSelection();return s?s.toString():''}""")
+    if not page:
+        return {"status": "error"}
+
+    try:
+        key = payload.key
+
+        # Playwright key names.
+        aliases = {
+            "Backspace": "Backspace",
+            "Enter": "Enter",
+            "Tab": "Tab",
+            "Escape": "Escape",
+            "Delete": "Delete",
+            "ArrowLeft": "ArrowLeft",
+            "ArrowRight": "ArrowRight",
+            "ArrowUp": "ArrowUp",
+            "ArrowDown": "ArrowDown",
+            "Home": "Home",
+            "End": "End",
+        }
+
+        await page.keyboard.press(
+            aliases.get(key, key)
+        )
+
+        mark_screen_dirty("key")
+
+        return {"status": "success"}
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+        }
+
+# ------------------------------------------------------------
+# Device clipboard bridge
+# ------------------------------------------------------------
+
+async def selected_text_from_page(page):
+    return await page.evaluate("""
+    () => {
+        const el = document.activeElement;
+
+        if (
+            el &&
+            typeof el.selectionStart === "number" &&
+            typeof el.selectionEnd === "number"
+        ) {
+            return String(el.value || "").substring(
+                el.selectionStart,
+                el.selectionEnd
+            );
+        }
+
+        const sel = window.getSelection();
+        return sel ? sel.toString() : "";
+    }
+    """)
+
 @app.get("/selection")
-async def selection():
-    p=await get_active_page()
-    try:return {"status":"success","text":await selected_text(p)}
-    except Exception as e:return {"status":"error","text":"","message":str(e)}
-@app.post("/cut")
-async def cut():
-    p=await get_active_page()
-    try:
-        t=await selected_text(p)
-        async with page_lock:await p.keyboard.press("Control+X")
-        mark_screen_dirty("cut");return {"status":"success","text":t}
-    except Exception as e:return {"status":"error","text":"","message":str(e)}
+async def get_selection():
+    page = await get_active_page()
 
-@app.get("/storage")
-async def storage():
-    size=files=0
-    for root,dirs,names in os.walk(DATA_DIR):
-        for n in names:
-            try:size+=os.path.getsize(os.path.join(root,n));files+=1
-            except:pass
-    return {"path":DATA_DIR,"exists":os.path.exists(DATA_DIR),"files":files,"size_mb":round(size/1048576,2),"persistent_profile":True}
-@app.get("/backup/status")
-async def backup_status_route():return backup_status
-@app.post("/backup")
-async def backup():
-    if not backup_status["configured"]:return {"status":"error","message":"Supabase is not configured"}
-    if backup_status["busy"]:return {"status":"busy","message":"Backup/restore already running"}
-    asyncio.get_running_loop().run_in_executor(None,backup_worker);return {"status":"started"}
-@app.post("/restore")
-async def restore():
-    if not backup_status["configured"]:return {"status":"error","message":"Supabase is not configured"}
-    if backup_status["busy"]:return {"status":"busy","message":"Backup/restore already running"}
-    backup_status["busy"]=True;backup_status["last_error"]=None
+    if not page:
+        return {"status": "error", "text": ""}
+
     try:
-        await restore_profile();return {"status":"success","message":"Profile restored from Supabase"}
-    except Exception as e:backup_status["last_error"]=str(e);return {"status":"error","message":str(e)}
-    finally:backup_status["busy"]=False
+        text = await selected_text_from_page(page)
+        return {"status": "success", "text": text}
+    except Exception as e:
+        return {"status": "error", "text": "", "message": str(e)}
+
+@app.post("/cut")
+async def cut_selection():
+    page = await get_active_page()
+
+    if not page:
+        return {"status": "error", "text": ""}
+
+    try:
+        text = await selected_text_from_page(page)
+
+        async with page_lock:
+            await page.keyboard.press("Control+X")
+
+        mark_screen_dirty("cut")
+
+        return {
+            "status": "success",
+            "text": text,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "text": "",
+            "message": str(e),
+        }
+
+# ------------------------------------------------------------
+# Diagnostics
+# ------------------------------------------------------------
 
 @app.get("/stats")
 async def stats():
     return await build_stats()
+
+@app.get("/storage")
+async def storage():
+    total_size = 0
+    file_count = 0
+
+    try:
+        for root, dirs, files in os.walk(DATA_DIR):
+            for name in files:
+                try:
+                    total_size += os.path.getsize(
+                        os.path.join(root, name)
+                    )
+                    file_count += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return {
+        "path": DATA_DIR,
+        "exists": os.path.exists(DATA_DIR),
+        "files": file_count,
+        "size_mb": round(total_size / 1024 / 1024, 2),
+        "persistent_profile": True,
+    }
