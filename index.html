@@ -152,7 +152,9 @@ button:active{
   inset:0;
   width:100%;
   height:100%;
-  object-fit:fill;
+  /* Never stretch Chromium. Preserve its real viewport aspect ratio. */
+  object-fit:contain;
+  object-position:center center;
   display:block;
   pointer-events:none;
   user-select:none;
@@ -442,7 +444,7 @@ html.chromeOnly #fullHideButton{display:block}
   </div>
 
   <div class="settingRow">
-    <label><span>Chromium device size</span><b>Auto-fit</b></label>
+    <label><span>Chromium device size</span><b id="autoFitValue">Auto-fit</b></label>
     <label style="justify-content:flex-start;gap:8px"><input id="autoDevice" type="checkbox" checked> Follow this phone/browser size</label>
   </div>
 
@@ -458,12 +460,12 @@ html.chromeOnly #fullHideButton{display:block}
 
   <div class="settingRow">
     <label><span>App UI scale</span><b id="uiScaleValue">100%</b></label>
-    <input id="uiScale" type="range" min="50" max="150" step="5" value="100">
+    <input id="uiScale" type="range" min="35" max="150" step="5" value="100">
   </div>
 
   <div class="settingRow">
     <label><span>Chromium UI scale</span><b id="chromiumScaleValue">100%</b></label>
-    <input id="chromiumScale" type="range" min="70" max="180" step="5" value="100">
+    <input id="chromiumScale" type="range" min="50" max="220" step="5" value="100">
   </div>
 
   <div class="settingRow">
@@ -506,6 +508,7 @@ const $ = id => document.getElementById(id);
 
 const screenStream = $("screenStream");
 const screenSurface = $("screenSurface");
+let remoteViewport = {width:360,height:740};
 const touchLayer = $("touchLayer");
 const statusEl = $("status");
 
@@ -594,12 +597,16 @@ async function updateBackupStatus(){
 
 function syncDeviceViewport(){
   if(!$("autoDevice")?.checked)return;
-  // Use the actual Chromium drawing surface, not the whole browser window.
-  // This preserves portrait/landscape proportions and avoids width stretching.
+  // Match the REAL drawing surface. Chromium scale enlarges the virtual
+  // viewport: higher % = smaller page/UI, lower % = larger page/UI.
   const r=$('screenSurface').getBoundingClientRect();
   const scale=Number($("chromiumScale")?.value||100)/100;
-  const w=Math.round(Math.max(280,Math.min(2560,r.width/scale)));
-  const h=Math.round(Math.max(400,Math.min(3200,r.height/scale)));
+  const w=Math.round(Math.max(280,Math.min(2560,r.width*scale)));
+  const h=Math.round(Math.max(400,Math.min(3200,r.height*scale)));
+  remoteViewport={width:w,height:h};
+  $("width").value=Math.max(320,Math.min(1280,w));
+  $("height").value=Math.max(240,Math.min(900,h));
+  updateSettingLabels();
   timedAction("/settings",{auto_device_size:true,device_width:w,device_height:h,chromium_ui_scale:scale});
 }
 
@@ -835,9 +842,16 @@ async function loadSettings(){
     $("format").value = s.format || "png";
     $("quality").value = s.quality ?? 70;
     $("interval").value = s.interval ?? 180;
-    $("width").value = s.width ?? 854;
-    $("height").value = s.height ?? 480;
-
+    $("autoDevice").checked = s.auto_device_size !== false;
+    const vp = d.viewport || {};
+    $("width").value = s.auto_device_size !== false ? (vp.width ?? s.device_width ?? 360) : (s.width ?? 854);
+    $("height").value = s.auto_device_size !== false ? (vp.height ?? s.device_height ?? 740) : (s.height ?? 480);
+    remoteViewport={width:Number(vp.width ?? $("width").value),height:Number(vp.height ?? $("height").value)};
+    if(s.chromium_ui_scale != null){
+      const pct=Math.round(Number(s.chromium_ui_scale)*100);
+      $("chromiumScale").value=pct;
+      $("chromiumScaleValue").textContent=pct+"%";
+    }
     updateSettingLabels();
   }catch{}
 }
@@ -848,6 +862,8 @@ function updateSettingLabels(){
   $("intervalValue").textContent = $("interval").value + " ms";
   $("widthValue").textContent = $("width").value;
   $("heightValue").textContent = $("height").value;
+  const af=$("autoFitValue");
+  if(af) af.textContent=$("autoDevice").checked ? "Auto-fit" : "Manual";
 }
 
 ["format","quality","interval","width","height"].forEach(id=>{
@@ -886,9 +902,22 @@ $("autoDevice").onchange=()=>{
   else pushSettings();
 };
 
-["format","quality","interval","width","height"].forEach(id=>{
+["format","quality","interval"].forEach(id=>{
   $(id).addEventListener("input",pushSettings);
   $(id).addEventListener("change",pushSettings);
+});
+
+["width","height"].forEach(id=>{
+  $(id).addEventListener("input",()=>{
+    $("autoDevice").checked=false;
+    remoteViewport={width:Number($("width").value),height:Number($("height").value)};
+    updateSettingLabels();
+    pushSettings();
+  });
+  $(id).addEventListener("change",()=>{
+    $("autoDevice").checked=false;
+    pushSettings();
+  });
 });
 
 /* ---------------------------------------------------------
@@ -911,16 +940,21 @@ screenStream.addEventListener("dragstart",e=>e.preventDefault());
 
 function remoteCoords(e){
   const rect = screenSurface.getBoundingClientRect();
-
-  const x = ((e.clientX - rect.left) / rect.width) *
-    Number($("width").value);
-
-  const y = ((e.clientY - rect.top) / rect.height) *
-    Number($("height").value);
-
+  const remoteW = Number(remoteViewport.width || $("width").value) || rect.width;
+  const remoteH = Number(remoteViewport.height || $("height").value) || rect.height;
+  const imageRatio = remoteW / remoteH;
+  const surfaceRatio = rect.width / rect.height;
+  let drawW, drawH, left, top;
+  if(imageRatio > surfaceRatio){
+    drawW=rect.width; drawH=drawW/imageRatio; left=rect.left; top=rect.top+(rect.height-drawH)/2;
+  }else{
+    drawH=rect.height; drawW=drawH*imageRatio; left=rect.left+(rect.width-drawW)/2; top=rect.top;
+  }
+  const nx=Math.max(0,Math.min(1,(e.clientX-left)/drawW));
+  const ny=Math.max(0,Math.min(1,(e.clientY-top)/drawH));
   return {
-    x:Math.max(0,Math.min(Number($("width").value)-1,x)),
-    y:Math.max(0,Math.min(Number($("height").value)-1,y))
+    x:nx*remoteW,
+    y:ny*remoteH
   };
 }
 
