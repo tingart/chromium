@@ -520,12 +520,27 @@ async def import_cookies(payload: CookiePayload):
     if not context:
         return {"status": "error", "message": "Browser context not ready"}
     try:
-        await context.add_cookies(payload.cookies)
+        cleaned_cookies = []
+        for cookie in payload.cookies:
+            # Map Cookie-Editor sameSite values to Playwright's expected format
+            if "sameSite" in cookie:
+                val = str(cookie["sameSite"]).lower()
+                if val == "strict":
+                    cookie["sameSite"] = "Strict"
+                elif val == "lax":
+                    cookie["sameSite"] = "Lax"
+                elif val in ["none", "no_restriction", "no-restriction"]:
+                    cookie["sameSite"] = "None"
+                else:
+                    cookie.pop("sameSite", None)
+            cleaned_cookies.append(cookie)
+
+        await context.add_cookies(cleaned_cookies)
         mark_screen_dirty("cookies-imported")
-        return {"status": "success", "imported": len(payload.cookies)}
+        return {"status": "success", "imported": len(cleaned_cookies)}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-
+        
 # ------------------------------------------------------------
 # Basic routes
 # ------------------------------------------------------------
