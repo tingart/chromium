@@ -339,40 +339,61 @@ select{
   }
 }
 
-#loginOverlay{position:fixed;inset:0;z-index:1000;background:#111318;display:flex;align-items:center;justify-content:center;padding:20px}
-#loginOverlay.hidden{display:none}
-.loginCard{width:min(360px,100%);background:#1b1e25;border:1px solid #353a46;border-radius:18px;padding:20px}
-.loginCard h2{margin:0 0 14px}
-.loginCard input{width:100%;margin:6px 0;padding:11px;border-radius:10px;border:1px solid #353a46;background:#242832;color:#fff}
-.loginCard button{width:100%;margin-top:10px}
-#fullHideButton{position:fixed;z-index:2000;width:32px;height:32px;min-height:32px;padding:0;border-radius:50%;font-size:14px;display:none;touch-action:none;box-shadow:0 3px 12px rgba(0,0,0,.45)}
-html.chromeOnly #browserHeader,html.chromeOnly #status,html.chromeOnly #toolPanel,html.chromeOnly #settingsPanel,html.chromeOnly #miniToolButton,html.chromeOnly #keyboardInput{display:none!important}
-html.chromeOnly #browserMain{height:100%!important}
-html.chromeOnly #fullHideButton{display:block}
+#loginScreen{
+  position:fixed; inset:0; z-index:1000; display:flex; align-items:center; justify-content:center;
+  background:#111318; padding:20px;
+}
+#loginCard{
+  width:min(340px,100%); background:#1b1e25; border:1px solid #353a46; border-radius:18px;
+  padding:20px; box-shadow:0 12px 40px rgba(0,0,0,.45);
+}
+#loginCard h2{margin:0 0 6px;font-size:20px}
+#loginCard p{margin:0 0 16px;color:#9ca3af;font-size:12px}
+#loginCard input{
+  width:100%; height:42px; margin:6px 0; padding:0 11px; border-radius:10px;
+  border:1px solid #353a46; background:#242832; color:#fff; outline:none;
+}
+#loginBtn{width:100%;margin-top:8px;height:42px}
+#loginError{min-height:18px;color:#ef6b73;font-size:11px;margin-top:8px}
+body.locked #browserHeader, body.locked #browserMain, body.locked #toolPanel,
+body.locked #settingsPanel, body.locked #miniToolButton{display:none!important}
 
+#compactButton{
+  position:fixed; right:8px; top:8px; z-index:200; width:30px; height:30px; min-height:30px;
+  padding:0; border-radius:8px; font-size:13px; opacity:.78; touch-action:none;
+  display:flex; align-items:center; justify-content:center;
+}
+#compactButton.dragging{opacity:.95}
+body.compact #browserHeader,
+body.compact #toolPanel,
+body.compact #settingsPanel,
+body.compact #status,
+body.compact #miniToolButton{display:none!important}
+body.compact #browserMain{height:100%!important}
+body.compact #screenSurface{inset:0!important}
+body.compact #compactButton{display:flex}
 </style>
 </head>
 
-<body>
+<body class="locked">
 
-<div id="loginOverlay">
-  <div class="loginCard">
+<section id="loginScreen">
+  <form id="loginCard">
     <h2>Remote Chromium</h2>
-    <div style="color:#9ca3af;font-size:12px;margin-bottom:10px">Login required</div>
+    <p>Login required to access this browser.</p>
     <input id="loginUser" autocomplete="username" placeholder="Username">
-    <input id="loginPass" type="password" autocomplete="current-password" placeholder="Password">
-    <button id="loginBtn">Login</button>
-    <div id="loginError" style="color:#ffadb2;font-size:12px;margin-top:10px"></div>
-  </div>
-</div>
-<button id="fullHideButton" title="Show controls">☰</button>
-
+    <input id="loginPass" autocomplete="current-password" type="password" placeholder="Password">
+    <button id="loginBtn" type="submit">Login</button>
+    <div id="loginError"></div>
+  </form>
+</section>
 
 <header id="browserHeader">
   <div id="tabsBar"></div>
   <button id="newTabBtn" title="New tab">+</button>
 </header>
 
+<button id="compactButton" title="Show controls">↙</button>
 <main id="browserMain">
   <div id="screenSurface">
     <img id="screenStream" alt="Remote Chromium screen" draggable="false">
@@ -412,10 +433,7 @@ html.chromeOnly #fullHideButton{display:block}
     <button id="fullscreenBtn">Fullscreen</button>
 
     <button id="debugBtn" class="toolWide">Debug: OFF</button>
-    <button id="collapseBtn" class="toolWide">Panel</button>
-    <button id="chromeOnlyBtn" class="toolWide">Hide UI</button>
-    <button id="backupBtn" class="toolWide">Backup now</button>
-    <button id="logoutBtn" class="toolWide">Logout</button>
+    <button id="collapseBtn" class="toolWide">Minimize</button>
   </div>
 </section>
 
@@ -442,11 +460,6 @@ html.chromeOnly #fullHideButton{display:block}
   </div>
 
   <div class="settingRow">
-    <label><span>Chromium device size</span><b>Auto-fit</b></label>
-    <label style="justify-content:flex-start;gap:8px"><input id="autoDevice" type="checkbox" checked> Follow this phone/browser size</label>
-  </div>
-
-  <div class="settingRow">
     <label><span>Remote width</span><b id="widthValue">854</b></label>
     <input id="width" type="range" min="320" max="1280" step="16" value="854">
   </div>
@@ -458,7 +471,7 @@ html.chromeOnly #fullHideButton{display:block}
 
   <div class="settingRow">
     <label><span>UI scale</span><b id="uiScaleValue">100%</b></label>
-    <input id="uiScale" type="range" min="70" max="120" step="5" value="100">
+    <input id="uiScale" type="range" min="35" max="120" step="5" value="100">
   </div>
 
   <div class="settingRow">
@@ -488,6 +501,11 @@ html.chromeOnly #fullHideButton{display:block}
   <div style="margin-top:10px;font-size:10px;color:#9ca3af">
     Storage: <span id="storageText">checking…</span>
   </div>
+  <div style="margin-top:8px;display:flex;gap:6px">
+    <button id="backupBtn" style="flex:1">Backup now</button>
+    <button id="logoutBtn" style="flex:1">Logout</button>
+  </div>
+  <div id="backupText" style="margin-top:6px;font-size:10px;color:#9ca3af">Cloud backup: checking…</div>
 </section>
 
 <textarea id="keyboardInput"
@@ -497,6 +515,46 @@ html.chromeOnly #fullHideButton{display:block}
   spellcheck="false"></textarea>
 
 <script>
+
+const loginScreen = $("loginScreen");
+const loginForm = $("loginCard");
+const loginError = $("loginError");
+
+function enterBrowser(){
+  document.body.classList.remove("locked");
+  loginScreen.style.display="none";
+  startBrowser();
+}
+
+async function checkAuth(){
+  try{
+    const r = await fetch("/auth/status",{cache:"no-store"});
+    const d = await r.json();
+    if(d.authenticated) enterBrowser();
+  }catch{}
+}
+
+loginForm.addEventListener("submit",async e=>{
+  e.preventDefault();
+  loginError.textContent="";
+  const username=$("loginUser").value;
+  const password=$("loginPass").value;
+  try{
+    const r=await fetch("/login",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({username,password})
+    });
+    const d=await r.json();
+    if(!r.ok || d.status!=="success"){
+      loginError.textContent=d.message||"Invalid username or password";
+      return;
+    }
+    enterBrowser();
+  }catch{
+    loginError.textContent="Connection error";
+  }
+});
 const $ = id => document.getElementById(id);
 
 const screenStream = $("screenStream");
@@ -528,80 +586,21 @@ function setStatus(text){
   statusEl.textContent = text;
 }
 
-let uiSleeping = false;
-let backupTimer = null;
-
-async function checkAuth(){
-  try{
-    const r=await fetch("/auth/status",{cache:"no-store",credentials:"same-origin"});
-    const d=await r.json();
-    if(d.authenticated){ $("loginOverlay").classList.add("hidden"); return true; }
-  }catch{}
-  $("loginOverlay").classList.remove("hidden");
-  return false;
-}
-async function doLogin(){
-  const err=$("loginError"); err.textContent="";
-  try{
-    const r=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",
-      body:JSON.stringify({username:$("loginUser").value,password:$("loginPass").value})});
-    if(!r.ok){throw new Error("Wrong username or password");}
-    $("loginOverlay").classList.add("hidden");
-    location.reload();
-  }catch(e){err.textContent=e.message;}
-}
-$("loginBtn").onclick=doLogin;
-$("loginPass").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
-
-function setChromeOnly(on){
-  uiSleeping=on;
-  document.documentElement.classList.toggle("chromeOnly",on);
-  if(on){
-    if(statsTimer){clearInterval(statsTimer);statsTimer=null;}
-    if(backupTimer){clearInterval(backupTimer);backupTimer=null;}
-  }else{
-    if(!statsTimer)statsTimer=setInterval(updateStats,1000);
-    if(!backupTimer)backupTimer=setInterval(updateBackupStatus,5000);
-    updateStats(); updateBackupStatus();
-  }
-}
-$("chromeOnlyBtn").onclick=()=>setChromeOnly(true);
-$("fullHideButton").onclick=()=>setChromeOnly(false);
-
-$("backupBtn").onclick=async()=>{
-  setStatus("Creating cloud backup…");
-  try{
-    const d=await jsonPost("/backup/now");
-    setStatus(d.status==="success"?"Cloud backup complete":"Backup: "+(d.error||d.message));
-  }catch(e){setStatus("Backup failed: "+e.message);}
-};
-$("logoutBtn").onclick=async()=>{try{await jsonPost("/logout");}catch{} location.reload();};
-
-async function updateBackupStatus(){
-  try{
-    const r=await api("/backup/status");
-    if(r.status===401)return;
-    const d=await r.json();
-    const el=$("backupStatus");
-    if(el)el.textContent=`Cloud: ${d.status} | Last: ${d.last_backup?new Date(d.last_backup*1000).toLocaleTimeString():"never"}`;
-  }catch{}
-}
-
-function syncDeviceViewport(){
-  if(!$("autoDevice")?.checked)return;
-  const w=Math.round(Math.max(280,Math.min(window.innerWidth,1280)));
-  const h=Math.round(Math.max(400,Math.min(window.innerHeight,1600)));
-  timedAction("/settings",{auto_device_size:true,device_width:w,device_height:h});
-}
-
 function api(path, options={}){
   return fetch(path, {
     cache:"no-store",
+    credentials:"same-origin",
     ...options,
     headers:{
       "Content-Type":"application/json",
       ...(options.headers || {})
     }
+  }).then(r=>{
+    if(r.status===401){
+      document.body.classList.add("locked");
+      loginScreen.style.display="flex";
+    }
+    return r;
   });
 }
 
@@ -885,15 +884,13 @@ screenStream.addEventListener("dragstart",e=>e.preventDefault());
 function remoteCoords(e){
   const rect = screenSurface.getBoundingClientRect();
 
-  const x = ((e.clientX - rect.left) / rect.width) *
-    Number($("width").value);
-
-  const y = ((e.clientY - rect.top) / rect.height) *
-    Number($("height").value);
-
+  const rw = Number($("width").value) || rect.width;
+  const rh = Number($("height").value) || rect.height;
+  const x = ((e.clientX - rect.left) / rect.width) * rw;
+  const y = ((e.clientY - rect.top) / rect.height) * rh;
   return {
-    x:Math.max(0,Math.min(Number($("width").value)-1,x)),
-    y:Math.max(0,Math.min(Number($("height").value)-1,y))
+    x:Math.max(0,Math.min(rw-1,x)),
+    y:Math.max(0,Math.min(rh-1,y))
   };
 }
 
@@ -1279,7 +1276,6 @@ async function updateStorage(){
    Boot
 --------------------------------------------------------- */
 
-checkAuth();
 screenStream.src = "/screen?ts=" + Date.now();
 
 loadSettings();
@@ -1289,9 +1285,6 @@ updateStorage();
 
 statsTimer = setInterval(updateStats,1000);
 setInterval(refreshTabs,2500);
-backupTimer = setInterval(updateBackupStatus,5000);
-updateBackupStatus();
-syncDeviceViewport();
 
 screenStream.addEventListener("load",()=>{
   setStatus("Connected");
@@ -1301,25 +1294,88 @@ screenStream.addEventListener("error",()=>{
   setStatus("Stream error — reconnecting…");
 
   setTimeout(()=>{
-    checkAuth();
-screenStream.src = "/screen?ts=" + Date.now();
+    screenStream.src = "/screen?ts=" + Date.now();
   },1000);
 });
 
-let resizeSyncTimer=null;
 window.addEventListener("resize",()=>{
-  clearTimeout(resizeSyncTimer);
-  resizeSyncTimer=setTimeout(syncDeviceViewport,300);
+  // Remote coordinates are mapped from the actual surface rectangle,
+  // so no fixed mobile calibration is needed.
 });
 
-(function(){
- const b=$("fullHideButton"); let drag=false,sx=0,sy=0,sl=0,st=0;
- const saved=JSON.parse(localStorage.getItem("remoteMiniPos")||"null");
- if(saved){b.style.left=saved.x+"px";b.style.top=saved.y+"px";b.style.right="auto";b.style.bottom="auto";}
- b.addEventListener("pointerdown",e=>{drag=false;sx=e.clientX;sy=e.clientY;const r=b.getBoundingClientRect();sl=r.left;st=r.top;b.setPointerCapture(e.pointerId);});
- b.addEventListener("pointermove",e=>{if(!b.hasPointerCapture(e.pointerId))return;const dx=e.clientX-sx,dy=e.clientY-sy;if(Math.abs(dx)+Math.abs(dy)>4)drag=true;if(drag){b.style.left=Math.max(0,Math.min(innerWidth-b.offsetWidth,sl+dx))+"px";b.style.top=Math.max(0,Math.min(innerHeight-b.offsetHeight,st+dy))+"px";b.style.right="auto";b.style.bottom="auto";}});
- b.addEventListener("pointerup",e=>{if(drag){const r=b.getBoundingClientRect();localStorage.setItem("remoteMiniPos",JSON.stringify({x:r.left,y:r.top}));e.preventDefault();}});
-})();
+/* ---------------------------------------------------------
+   True compact Chromium-only mode
+--------------------------------------------------------- */
+const compactButton=$("compactButton");
+let compactMode=false;
+let dragState=null;
+
+function setCompact(on){
+  compactMode=!!on;
+  document.body.classList.toggle("compact",compactMode);
+  compactButton.textContent=compactMode?"↗":"↙";
+  compactButton.title=compactMode?"Show controls":"Chromium-only mode";
+  // No intervals, DOM rebuilding, or extra overlay is created here.
+}
+
+compactButton.addEventListener("pointerdown",e=>{
+  e.preventDefault();
+  dragState={
+    id:e.pointerId,
+    x:e.clientX,
+    y:e.clientY,
+    left:compactButton.offsetLeft,
+    top:compactButton.offsetTop,
+    moved:false
+  };
+  compactButton.setPointerCapture?.(e.pointerId);
+});
+
+compactButton.addEventListener("pointermove",e=>{
+  if(!dragState || dragState.id!==e.pointerId)return;
+  const dx=e.clientX-dragState.x, dy=e.clientY-dragState.y;
+  if(Math.abs(dx)>3 || Math.abs(dy)>3)dragState.moved=true;
+  compactButton.style.left=Math.max(0,Math.min(window.innerWidth-30,dragState.left+dx))+"px";
+  compactButton.style.top=Math.max(0,Math.min(window.innerHeight-30,dragState.top+dy))+"px";
+  compactButton.style.right="auto";
+});
+
+compactButton.addEventListener("pointerup",e=>{
+  if(!dragState)return;
+  const wasDrag=dragState.moved;
+  dragState=null;
+  if(!wasDrag)setCompact(!compactMode);
+});
+
+checkAuth();
+
+async function refreshBackupStatus(){
+  try{
+    const r=await api("/backup/status");
+    const d=await r.json();
+    if(!d.configured){
+      $("backupText").textContent="Cloud backup: not configured";
+      return;
+    }
+    const when=d.last_backup_iso||"never";
+    $("backupText").textContent=`Cloud backup: ${when}${d.error?" | "+d.error:""}`;
+  }catch{}
+}
+$("backupBtn")?.addEventListener("click",async()=>{
+  $("backupText").textContent="Cloud backup: backing up…";
+  try{
+    const d=await (await api("/backup",{method:"POST"})).json();
+    $("backupText").textContent=d.status==="success"
+      ?"Cloud backup: saved"
+      :"Cloud backup: "+(d.message||"failed");
+  }catch{ $("backupText").textContent="Cloud backup: failed"; }
+});
+$("logoutBtn")?.addEventListener("click",async()=>{
+  try{await api("/logout",{method:"POST"});}catch{}
+  location.reload();
+});
+setInterval(refreshBackupStatus,15000);
+
 </script>
 </body>
 </html>
