@@ -490,8 +490,7 @@ async def startup_event():
 
     playwright_instance = await async_playwright().start()
 
-    # Persistent Chromium profile.
-    # Cookies/localStorage/session data are stored here.
+    # Persistent Chromium profile with evasion flags applied.
     context = await playwright_instance.chromium.launch_persistent_context(
         user_data_dir=DATA_DIR,
         headless=True,
@@ -499,16 +498,18 @@ async def startup_event():
         device_scale_factor=1,
         is_mobile=False,
         has_touch=False,
+        ignore_default_args=["--enable-automation"],  # Removed automation flag
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
+            "Chrome/124.0.0.0 Safari/537.36"
         ),
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
             "--disable-background-networking",
             "--disable-background-timer-throttling",
             "--disable-renderer-backgrounding",
@@ -521,6 +522,12 @@ async def startup_event():
     await context.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined
+        });
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en']
+        });
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
         });
     """)
 
@@ -704,8 +711,6 @@ async def capture_frame(page):
     started = time.perf_counter()
 
     try:
-        # Do not disable animations here. That can make live pages/videos
-        # behave strangely and was a source of bad visual behavior.
         if fmt == "jpeg":
             data = await page.screenshot(
                 type="jpeg",
@@ -714,8 +719,6 @@ async def capture_frame(page):
                 scale="css",
             )
         elif fmt == "webp":
-            # Chromium/Playwright versions differ on WebP screenshot support.
-            # Try WebP first; fall back to PNG if unsupported.
             try:
                 data = await page.screenshot(
                     type="webp",
@@ -773,8 +776,6 @@ async def frame_generator():
             except Exception:
                 pass
 
-        # Wake immediately after user interaction/settings, otherwise
-        # respect the selected stream interval.
         try:
             await asyncio.wait_for(
                 screen_event.wait(),
@@ -954,8 +955,6 @@ async def new_tab():
         }
 
     try:
-        # Do not wait for Google to finish loading.
-        # This makes the new-tab action much faster.
         new_page = await context.new_page()
         pages.append(new_page)
         active_tab_index = len(pages) - 1
@@ -1090,8 +1089,6 @@ async def type_text(payload: TypePayload):
         return {"status": "error"}
 
     try:
-        # insert_text sends the whole string as text instead of generating
-        # one HTTP request per character. This prevents fast typing loss.
         await page.keyboard.insert_text(payload.text)
 
         mark_screen_dirty("type")
@@ -1117,7 +1114,6 @@ async def handle_key(payload: KeyPayload):
     try:
         key = payload.key
 
-        # Playwright key names.
         aliases = {
             "Backspace": "Backspace",
             "Enter": "Enter",
