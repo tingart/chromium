@@ -674,7 +674,7 @@ async def update_settings(payload: SettingsPayload):
     if payload.device_height is not None:
         stream_settings["device_height"] = clamp_int(payload.device_height, 400, 3200)
     if payload.chromium_ui_scale is not None:
-        stream_settings["chromium_ui_scale"] = max(0.7, min(1.8, float(payload.chromium_ui_scale)))
+        stream_settings["chromium_ui_scale"] = max(0.5, min(2.2, float(payload.chromium_ui_scale)))
 
     if context:
         try:
