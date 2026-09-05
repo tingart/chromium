@@ -1,0 +1,1273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Remote Chromium</title>
+
+<style>
+:root{
+  --ui-scale:1;
+  --header-h:54px;
+  --bg:#111318;
+  --panel:#1b1e25;
+  --panel2:#242832;
+  --line:#353a46;
+  --text:#f4f5f7;
+  --muted:#9ca3af;
+  --accent:#7c8cff;
+  --danger:#ef6b73;
+}
+
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+
+html,body{
+  margin:0;
+  width:100%;
+  height:100%;
+  overflow:hidden;
+  background:var(--bg);
+  color:var(--text);
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+}
+
+button,input{
+  font:inherit;
+}
+
+button{
+  color:var(--text);
+  border:1px solid var(--line);
+  background:var(--panel2);
+  border-radius:10px;
+  min-height:36px;
+  padding:0 11px;
+  cursor:pointer;
+}
+
+button:active{
+  transform:scale(.97);
+}
+
+#browserHeader{
+  height:var(--header-h);
+  display:flex;
+  align-items:center;
+  gap:5px;
+  padding:5px 6px;
+  background:#17191f;
+  border-bottom:1px solid var(--line);
+  position:relative;
+  z-index:20;
+}
+
+#tabsBar{
+  display:flex;
+  align-items:flex-end;
+  height:100%;
+  min-width:0;
+  overflow-x:auto;
+  overflow-y:hidden;
+  gap:3px;
+  flex:1;
+  scrollbar-width:none;
+}
+
+#tabsBar::-webkit-scrollbar{display:none}
+
+.tab{
+  height:39px;
+  min-width:90px;
+  max-width:180px;
+  padding:0 7px 0 11px;
+  display:flex;
+  align-items:center;
+  gap:7px;
+  border:1px solid #30343e;
+  border-bottom:0;
+  border-radius:13px 13px 0 0;
+  background:#20232b;
+  color:#aeb4bf;
+  flex:none;
+  user-select:none;
+}
+
+.tab.active{
+  background:#30343e;
+  color:#fff;
+}
+
+.tabTitle{
+  flex:1;
+  min-width:0;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  font-size:12px;
+}
+
+.tabClose{
+  width:24px;
+  min-width:24px;
+  height:24px;
+  min-height:24px;
+  padding:0;
+  border:0;
+  background:transparent;
+  color:#b7bdc9;
+}
+
+#newTabBtn{
+  width:36px;
+  min-width:36px;
+  min-height:36px;
+  padding:0;
+  border:0;
+  background:transparent;
+  font-size:21px;
+}
+
+#browserMain{
+  position:relative;
+  width:100%;
+  height:calc(100% - var(--header-h));
+  overflow:hidden;
+  background:#000;
+}
+
+#screenSurface{
+  position:absolute;
+  inset:0;
+  overflow:hidden;
+  background:#000;
+  touch-action:none;
+  user-select:none;
+  -webkit-user-select:none;
+  -webkit-touch-callout:none;
+  -webkit-tap-highlight-color:transparent;
+}
+
+#screenStream{
+  position:absolute;
+  inset:0;
+  width:100%;
+  height:100%;
+  object-fit:fill;
+  display:block;
+  pointer-events:none;
+  user-select:none;
+  -webkit-user-select:none;
+  -webkit-touch-callout:none;
+}
+
+#touchLayer{
+  position:absolute;
+  inset:0;
+  z-index:2;
+  touch-action:none;
+  user-select:none;
+  -webkit-user-select:none;
+  -webkit-touch-callout:none;
+}
+
+#status{
+  position:absolute;
+  left:7px;
+  bottom:7px;
+  z-index:10;
+  padding:5px 8px;
+  border-radius:8px;
+  background:rgba(0,0,0,.62);
+  color:#d6dae2;
+  font-size:10px;
+  pointer-events:none;
+  max-width:calc(100% - 14px);
+}
+
+#miniToolButton{
+  position:fixed;
+  right:10px;
+  bottom:10px;
+  z-index:50;
+  width:45px;
+  height:45px;
+  min-height:45px;
+  border-radius:50%;
+  padding:0;
+  font-size:20px;
+  background:rgba(28,31,39,.95);
+  box-shadow:0 5px 20px rgba(0,0,0,.4);
+}
+
+#toolPanel{
+  position:fixed;
+  right:10px;
+  bottom:10px;
+  z-index:49;
+  width:min(330px,calc(100vw - 20px));
+  max-height:calc(100vh - 75px);
+  overflow:auto;
+  background:rgba(25,28,35,.97);
+  border:1px solid var(--line);
+  border-radius:16px;
+  padding:10px;
+  box-shadow:0 10px 35px rgba(0,0,0,.5);
+  zoom:var(--ui-scale);
+  transform-origin:right bottom;
+}
+
+#toolPanel.hidden{
+  display:none;
+}
+
+.toolDrag{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:8px;
+  font-size:12px;
+  color:var(--muted);
+  cursor:move;
+  user-select:none;
+}
+
+.toolGrid{
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:6px;
+}
+
+.toolGrid button{
+  min-height:38px;
+  padding:0 5px;
+  font-size:12px;
+}
+
+.toolWide{
+  grid-column:span 2;
+}
+
+.toolDanger{
+  color:#ffadb2;
+}
+
+#settingsPanel{
+  position:fixed;
+  left:10px;
+  bottom:10px;
+  z-index:48;
+  width:min(360px,calc(100vw - 20px));
+  max-height:calc(100vh - 75px);
+  overflow:auto;
+  background:rgba(25,28,35,.98);
+  border:1px solid var(--line);
+  border-radius:16px;
+  padding:13px;
+  box-shadow:0 10px 35px rgba(0,0,0,.5);
+  zoom:var(--ui-scale);
+  display:none;
+}
+
+#settingsPanel.open{
+  display:block;
+}
+
+.settingRow{
+  margin:10px 0;
+}
+
+.settingRow label{
+  display:flex;
+  justify-content:space-between;
+  gap:10px;
+  font-size:12px;
+  margin-bottom:5px;
+  color:#dfe2e8;
+}
+
+.settingRow input[type=range],
+.settingRow select{
+  width:100%;
+}
+
+select{
+  background:var(--panel2);
+  color:var(--text);
+  border:1px solid var(--line);
+  border-radius:9px;
+  min-height:36px;
+  padding:0 8px;
+}
+
+.statBox{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:6px;
+  margin-top:10px;
+}
+
+.stat{
+  background:#20242d;
+  border:1px solid #303541;
+  border-radius:10px;
+  padding:7px;
+}
+
+.stat b{
+  display:block;
+  font-size:15px;
+}
+
+.stat span{
+  color:var(--muted);
+  font-size:10px;
+}
+
+#keyboardInput{
+  position:fixed;
+  left:-10000px;
+  top:-10000px;
+  width:1px;
+  height:1px;
+  opacity:.01;
+}
+
+@media(max-width:600px){
+  .tab{
+    min-width:82px;
+    max-width:135px;
+  }
+}
+
+#loginOverlay{position:fixed;inset:0;z-index:1000;background:#111318;display:flex;align-items:center;justify-content:center;padding:20px}
+#loginOverlay.hidden{display:none}
+.loginCard{width:min(360px,100%);background:#1b1e25;border:1px solid #353a46;border-radius:18px;padding:20px}
+.loginCard h2{margin:0 0 14px}
+.loginCard input{width:100%;margin:6px 0;padding:11px;border-radius:10px;border:1px solid #353a46;background:#242832;color:#fff}
+.loginCard button{width:100%;margin-top:10px}
+#fullHideButton{position:fixed;z-index:2000;width:32px;height:32px;min-height:32px;padding:0;border-radius:50%;font-size:14px;display:none;touch-action:none;box-shadow:0 3px 12px rgba(0,0,0,.45)}
+html.chromeOnly #browserHeader,html.chromeOnly #status,html.chromeOnly #toolPanel,html.chromeOnly #settingsPanel,html.chromeOnly #miniToolButton,html.chromeOnly #keyboardInput{display:none!important}
+html.chromeOnly #browserMain{height:100%!important}
+html.chromeOnly #fullHideButton{display:block}
+
+</style>
+</head>
+
+<body>
+
+<div id="loginOverlay">
+  <div class="loginCard">
+    <h2>Remote Chromium</h2>
+    <div style="color:#9ca3af;font-size:12px;margin-bottom:10px">Login required</div>
+    <input id="loginUser" autocomplete="username" placeholder="Username">
+    <input id="loginPass" type="password" autocomplete="current-password" placeholder="Password">
+    <button id="loginBtn">Login</button>
+    <div id="loginError" style="color:#ffadb2;font-size:12px;margin-top:10px"></div>
+  </div>
+</div>
+<button id="fullHideButton" title="Show controls">☰</button>
+
+
+<header id="browserHeader">
+  <div id="tabsBar"></div>
+  <button id="newTabBtn" title="New tab">+</button>
+</header>
+
+<main id="browserMain">
+  <div id="screenSurface">
+    <img id="screenStream" alt="Remote Chromium screen" draggable="false">
+    <div id="touchLayer"></div>
+  </div>
+
+  <div id="status">Connecting…</div>
+</main>
+
+<button id="miniToolButton" title="Tools">☰</button>
+
+<section id="toolPanel" class="hidden">
+  <div class="toolDrag">
+    <span>Browser tools</span>
+    <span>⋮⋮</span>
+  </div>
+
+  <div class="toolGrid">
+    <button id="backBtn">←</button>
+    <button id="forwardBtn">→</button>
+    <button id="reloadBtn">↻</button>
+    <button id="homeBtn">⌂</button>
+
+    <button id="stopBtn">■</button>
+    <button id="newTabTool">＋ Tab</button>
+    <button id="closeTabTool">× Tab</button>
+    <button id="settingsBtn">⚙</button>
+
+    <button id="copyBtn" class="toolWide">Copy</button>
+    <button id="cutBtn" class="toolWide">Cut</button>
+    <button id="pasteBtn" class="toolWide">Paste</button>
+    <button id="keyboardBtn" class="toolWide">Keyboard</button>
+
+    <button id="scrollUpBtn">↑ Scroll</button>
+    <button id="scrollDownBtn">↓ Scroll</button>
+    <button id="rightClickBtn">Right click</button>
+    <button id="fullscreenBtn">Fullscreen</button>
+
+    <button id="debugBtn" class="toolWide">Debug: OFF</button>
+    <button id="collapseBtn" class="toolWide">Panel</button>
+    <button id="chromeOnlyBtn" class="toolWide">Hide UI</button>
+    <button id="backupBtn" class="toolWide">Backup now</button>
+    <button id="logoutBtn" class="toolWide">Logout</button>
+  </div>
+</section>
+
+<section id="settingsPanel">
+  <h3 style="margin:0 0 8px;font-size:15px">Stream & UI settings</h3>
+
+  <div class="settingRow">
+    <label><span>Format</span><b id="formatValue">PNG</b></label>
+    <select id="format">
+      <option value="png">PNG</option>
+      <option value="jpeg">JPEG</option>
+      <option value="webp">WebP</option>
+    </select>
+  </div>
+
+  <div class="settingRow">
+    <label><span>Quality</span><b id="qualityValue">70</b></label>
+    <input id="quality" type="range" min="10" max="100" step="5" value="70">
+  </div>
+
+  <div class="settingRow">
+    <label><span>Frame interval</span><b id="intervalValue">180 ms</b></label>
+    <input id="interval" type="range" min="30" max="1000" step="10" value="180">
+  </div>
+
+  <div class="settingRow">
+    <label><span>Remote width</span><b id="widthValue">854</b></label>
+    <input id="width" type="range" min="320" max="1280" step="16" value="854">
+  </div>
+
+  <div class="settingRow">
+    <label><span>Remote height</span><b id="heightValue">480</b></label>
+    <input id="height" type="range" min="240" max="900" step="16" value="480">
+  </div>
+
+  <div class="settingRow">
+    <label><span>UI scale</span><b id="uiScaleValue">100%</b></label>
+    <input id="uiScale" type="range" min="70" max="120" step="5" value="100">
+  </div>
+
+  <div class="settingRow">
+    <label><span>Long press</span><b id="longPressValue">Right click</b></label>
+    <select id="longPress">
+      <option value="right_click">Right click</option>
+      <option value="none">None</option>
+    </select>
+  </div>
+
+  <div class="settingRow">
+    <label><span>Scroll sensitivity</span><b id="scrollValue">1.5×</b></label>
+    <input id="scrollSensitivity" type="range" min="0.5" max="3" step="0.1" value="1.5">
+  </div>
+
+  <div class="statBox">
+    <div class="stat"><b id="fps">—</b><span>server FPS</span></div>
+    <div class="stat"><b id="rtt">—</b><span>stats RTT</span></div>
+    <div class="stat"><b id="ram">—</b><span>container RAM</span></div>
+    <div class="stat"><b id="cpu">—</b><span>container CPU</span></div>
+    <div class="stat"><b id="frame">—</b><span>frame size</span></div>
+    <div class="stat"><b id="encode">—</b><span>capture/encode</span></div>
+    <div class="stat"><b id="chromeRam">—</b><span>Chromium RAM</span></div>
+    <div class="stat"><b id="actionRtt">—</b><span>last action RTT</span></div>
+  </div>
+
+  <div style="margin-top:10px;font-size:10px;color:#9ca3af">
+    Storage: <span id="storageText">checking…</span>
+  </div>
+</section>
+
+<textarea id="keyboardInput"
+  autocomplete="off"
+  autocorrect="off"
+  autocapitalize="off"
+  spellcheck="false"></textarea>
+
+<script>
+const $ = id => document.getElementById(id);
+
+const screenStream = $("screenStream");
+const screenSurface = $("screenSurface");
+let remoteViewport = {width:360,height:740};
+const touchLayer = $("touchLayer");
+const statusEl = $("status");
+
+let activeIndex = 0;
+let tabs = [];
+
+let longPressTimer = null;
+let pointerStart = null;
+let lastPointer = null;
+let moved = false;
+
+let scrollSensitivity = Number(localStorage.getItem("scrollSensitivity") || 1.5);
+let longPressMode = localStorage.getItem("longPress") || "right_click";
+
+let debug = false;
+let keyboardOpen = false;
+
+let actionRTT = null;
+let statsTimer = null;
+
+let typeQueue = "";
+let typeTimer = null;
+
+function setStatus(text){
+  statusEl.textContent = text;
+}
+
+let uiSleeping = false;
+let backupTimer = null;
+
+async function checkAuth(){
+  try{
+    const r=await fetch("/auth/status",{cache:"no-store",credentials:"same-origin"});
+    const d=await r.json();
+    if(d.authenticated){ $("loginOverlay").classList.add("hidden"); return true; }
+  }catch{}
+  $("loginOverlay").classList.remove("hidden");
+  return false;
+}
+async function doLogin(){
+  const err=$("loginError"); err.textContent="";
+  try{
+    const r=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",
+      body:JSON.stringify({username:$("loginUser").value,password:$("loginPass").value})});
+    if(!r.ok){throw new Error("Wrong username or password");}
+    $("loginOverlay").classList.add("hidden");
+    location.reload();
+  }catch(e){err.textContent=e.message;}
+}
+$("loginBtn").onclick=doLogin;
+$("loginPass").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
+
+function setChromeOnly(on){
+  uiSleeping=on;
+  document.documentElement.classList.toggle("chromeOnly",on);
+  if(on){
+    if(statsTimer){clearInterval(statsTimer);statsTimer=null;}
+    if(backupTimer){clearInterval(backupTimer);backupTimer=null;}
+  }else{
+    if(!statsTimer)statsTimer=setInterval(updateStats,1000);
+    if(!backupTimer)backupTimer=setInterval(updateBackupStatus,5000);
+    updateStats(); updateBackupStatus();
+  }
+}
+$("chromeOnlyBtn").onclick=()=>setChromeOnly(true);
+$("fullHideButton").onclick=()=>setChromeOnly(false);
+
+$("backupBtn").onclick=async()=>{
+  setStatus("Creating cloud backup…");
+  try{
+    const d=await jsonPost("/backup/now");
+    setStatus(d.status==="success"?"Cloud backup complete":"Backup: "+(d.error||d.message));
+  }catch(e){setStatus("Backup failed: "+e.message);}
+};
+$("logoutBtn").onclick=async()=>{try{await jsonPost("/logout");}catch{} location.reload();};
+
+async function updateBackupStatus(){
+  try{
+    const r=await api("/backup/status");
+    if(r.status===401)return;
+    const d=await r.json();
+    const el=$("backupStatus");
+    if(el)el.textContent=`Cloud: ${d.status} | Last: ${d.last_backup?new Date(d.last_backup*1000).toLocaleTimeString():"never"}`;
+  }catch{}
+}
+
+function api(path, options={}){
+  return fetch(path, {
+    cache:"no-store",
+    ...options,
+    headers:{
+      "Content-Type":"application/json",
+      ...(options.headers || {})
+    }
+  });
+}
+
+function jsonPost(path, body={}){
+  return api(path, {
+    method:"POST",
+    body:JSON.stringify(body)
+  }).then(r=>r.json());
+}
+
+function updateStatusFromResult(data){
+  if(data?.status === "error"){
+    setStatus("Error: " + (data.message || "request failed"));
+  }
+}
+
+async function timedAction(path, body={}){
+  const started = performance.now();
+  try{
+    const data = await jsonPost(path, body);
+    actionRTT = performance.now() - started;
+    updateStatusFromResult(data);
+    return data;
+  }catch(e){
+    actionRTT = performance.now() - started;
+    setStatus("Network error");
+    throw e;
+  }
+}
+
+/* ---------------------------------------------------------
+   Tabs
+--------------------------------------------------------- */
+
+function tabIcon(url){
+  if(!url || url === "about:blank") return "🌐";
+  try{
+    const host = new URL(url).hostname;
+    return host ? "🌐" : "•";
+  }catch{
+    return "🌐";
+  }
+}
+
+function renderTabs(){
+  const bar = $("tabsBar");
+  bar.innerHTML = "";
+
+  tabs.forEach((tab, index)=>{
+    const el = document.createElement("div");
+    el.className = "tab" + (index === activeIndex ? " active" : "");
+
+    const title = document.createElement("div");
+    title.className = "tabTitle";
+    title.textContent = tab.title || tab.url || "New Tab";
+    title.title = tab.url || "";
+
+    const icon = document.createElement("span");
+    icon.textContent = tabIcon(tab.url);
+
+    const close = document.createElement("button");
+    close.className = "tabClose";
+    close.textContent = "×";
+    close.title = "Close tab";
+
+    close.onclick = async e=>{
+      e.stopPropagation();
+      await timedAction("/tabs/close",{index});
+      await refreshTabs();
+    };
+
+    el.onclick = async ()=>{
+      if(index !== activeIndex){
+        await timedAction("/tabs/switch",{index});
+        await refreshTabs();
+      }
+    };
+
+    el.append(icon,title,close);
+    bar.appendChild(el);
+  });
+}
+
+async function refreshTabs(){
+  try{
+    const r = await api("/tabs");
+    const data = await r.json();
+    tabs = data.tabs || [];
+    activeIndex = data.active_index || 0;
+    renderTabs();
+
+    const active = tabs[activeIndex];
+    if(active){
+      setStatus(active.title || active.url || "Ready");
+    }
+  }catch{
+    setStatus("Tabs unavailable");
+  }
+}
+
+async function newTab(){
+  const data = await timedAction("/tabs/new");
+  if(data?.tabs){
+    tabs = data.tabs;
+    activeIndex = data.active_index || 0;
+    renderTabs();
+  }
+}
+
+/* ---------------------------------------------------------
+   Navigation
+--------------------------------------------------------- */
+
+$("backBtn").onclick = ()=>timedAction("/history/back").then(refreshTabs);
+$("forwardBtn").onclick = ()=>timedAction("/history/forward").then(refreshTabs);
+$("reloadBtn").onclick = ()=>timedAction("/reload");
+$("homeBtn").onclick = ()=>timedAction("/home").then(refreshTabs);
+$("stopBtn").onclick = ()=>timedAction("/stop");
+
+$("newTabBtn").onclick = newTab;
+$("newTabTool").onclick = newTab;
+
+$("closeTabTool").onclick = async ()=>{
+  const data = await timedAction("/tabs/close",{index:activeIndex});
+  if(data?.tabs){
+    tabs = data.tabs;
+    activeIndex = data.active_index || 0;
+    renderTabs();
+  }
+};
+
+/* ---------------------------------------------------------
+   Tool panel
+--------------------------------------------------------- */
+
+const toolPanel = $("toolPanel");
+const miniToolButton = $("miniToolButton");
+
+function openTools(){
+  toolPanel.classList.remove("hidden");
+  miniToolButton.style.display = "none";
+}
+
+function closeTools(){
+  toolPanel.classList.add("hidden");
+  miniToolButton.style.display = "block";
+}
+
+miniToolButton.onclick = openTools;
+$("collapseBtn").onclick = closeTools;
+
+/* ---------------------------------------------------------
+   Settings
+--------------------------------------------------------- */
+
+const settingsPanel = $("settingsPanel");
+
+$("settingsBtn").onclick = ()=>{
+  settingsPanel.classList.toggle("open");
+};
+
+function applyUiScale(value){
+  document.documentElement.style.setProperty(
+    "--ui-scale",
+    String(value / 100)
+  );
+
+  const headerHeight = Math.round(54 * value / 100);
+  document.documentElement.style.setProperty(
+    "--header-h",
+    headerHeight + "px"
+  );
+
+  $("uiScaleValue").textContent = value + "%";
+  localStorage.setItem("uiScale", value);
+}
+
+$("uiScale").value = Number(localStorage.getItem("uiScale") || 100);
+applyUiScale(Number($("uiScale").value));
+
+$("uiScale").oninput = e=>{
+  applyUiScale(Number(e.target.value));
+};
+
+$("longPress").value = longPressMode;
+$("longPress").onchange = e=>{
+  longPressMode = e.target.value;
+  localStorage.setItem("longPress",longPressMode);
+  $("longPressValue").textContent =
+    longPressMode === "right_click" ? "Right click" : "None";
+};
+
+$("longPressValue").textContent =
+  longPressMode === "right_click" ? "Right click" : "None";
+
+$("scrollSensitivity").value = scrollSensitivity;
+$("scrollValue").textContent = scrollSensitivity.toFixed(1) + "×";
+
+$("scrollSensitivity").oninput = e=>{
+  scrollSensitivity = Number(e.target.value);
+  $("scrollValue").textContent = scrollSensitivity.toFixed(1) + "×";
+  localStorage.setItem("scrollSensitivity",scrollSensitivity);
+};
+
+async function loadSettings(){
+  try{
+    const r = await api("/settings");
+    const d = await r.json();
+    const s = d.settings || {};
+    $("format").value = s.format || "png";
+    $("quality").value = s.quality ?? 70;
+    $("interval").value = s.interval ?? 180;
+    $("width").value = s.width ?? 854;
+    $("height").value = s.height ?? 480;
+    updateSettingLabels();
+  }catch{}
+}
+
+function updateSettingLabels(){
+  $("formatValue").textContent = $("format").value.toUpperCase();
+  $("qualityValue").textContent = $("quality").value;
+  $("intervalValue").textContent = $("interval").value + " ms";
+  $("widthValue").textContent = $("width").value;
+  $("heightValue").textContent = $("height").value;
+}
+
+["format","quality","interval","width","height"].forEach(id=>{
+  $(id).addEventListener("input",updateSettingLabels);
+  $(id).addEventListener("change",updateSettingLabels);
+});
+
+let settingTimer = null;
+
+function pushSettings(){
+  clearTimeout(settingTimer);
+
+  settingTimer = setTimeout(async ()=>{
+    try{
+      const data = await jsonPost("/settings",{
+        format:$("format").value,
+        quality:Number($("quality").value),
+        interval:Number($("interval").value),
+        width:Number($("width").value),
+        height:Number($("height").value),
+        auto_device_size:false
+      });
+
+      updateSettingLabels();
+
+      if(data?.status === "success"){
+        setStatus("Settings applied");
+      }
+    }catch{}
+  },120);
+}
+
+["format","quality","interval","width","height"].forEach(id=>{
+  $(id).addEventListener("input",pushSettings);
+  $(id).addEventListener("change",pushSettings);
+});
+
+function sendPointerClick(e, action="click"){
+  const p = remoteCoords(e);
+  await timedAction("/touch",{
+    x:p.x,
+    y:p.y,
+    action
+  });
+}
+
+touchLayer.addEventListener("pointerdown",e=>{
+  if(e.pointerType === "mouse" && e.button !== 0) return;
+
+  e.preventDefault();
+
+  try{
+    touchLayer.setPointerCapture(e.pointerId);
+  }catch{}
+
+  pointerStart = {
+    x:e.clientX,
+    y:e.clientY,
+    time:performance.now(),
+    pointerId:e.pointerId
+  };
+
+  lastPointer = pointerStart;
+  moved = false;
+
+  if(longPressMode === "right_click"){
+    clearTimeout(longPressTimer);
+
+    longPressTimer = setTimeout(async ()=>{
+      if(pointerStart && !moved){
+        await sendPointerClick(e,"right_click");
+        pointerStart = null;
+      }
+    },650);
+  }
+});
+
+let scrollPending = null;
+let scrollTimer = null;
+
+function queueScroll(dx,dy){
+  scrollPending = {
+    dx:(scrollPending?.dx || 0) + dx,
+    dy:(scrollPending?.dy || 0) + dy
+  };
+
+  if(scrollTimer) return;
+
+  scrollTimer = setTimeout(async ()=>{
+    const d = scrollPending;
+    scrollPending = null;
+    scrollTimer = null;
+
+    if(!d) return;
+
+    await timedAction("/touch",{
+      x:0,
+      y:0,
+      action:"scroll",
+      delta_x:d.dx * scrollSensitivity,
+      delta_y:d.dy * scrollSensitivity
+    });
+  },45);
+}
+
+touchLayer.addEventListener("pointermove",e=>{
+  if(!pointerStart) return;
+
+  e.preventDefault();
+
+  const dx = e.clientX - lastPointer.x;
+  const dy = e.clientY - lastPointer.y;
+
+  if(Math.abs(e.clientX-pointerStart.x) > 7 ||
+     Math.abs(e.clientY-pointerStart.y) > 7){
+    moved = true;
+    clearTimeout(longPressTimer);
+  }
+
+  if(e.pointerType === "touch" && moved){
+    queueScroll(-dx,-dy);
+  }
+
+  lastPointer = {
+    x:e.clientX,
+    y:e.clientY,
+    time:performance.now()
+  };
+});
+
+touchLayer.addEventListener("pointerup",async e=>{
+  if(!pointerStart) return;
+
+  e.preventDefault();
+  clearTimeout(longPressTimer);
+
+  const wasMoved = moved;
+
+  pointerStart = null;
+  lastPointer = null;
+
+  if(!wasMoved){
+    await sendPointerClick(e,"click");
+  }
+});
+
+touchLayer.addEventListener("pointercancel",e=>{
+  clearTimeout(longPressTimer);
+  pointerStart = null;
+  lastPointer = null;
+});
+
+/* ---------------------------------------------------------
+   Manual scroll controls
+--------------------------------------------------------- */
+
+$("scrollUpBtn").onclick = ()=>{
+  timedAction("/touch",{
+    x:0,y:0,action:"scroll",
+    delta_y:-600
+  });
+};
+
+$("scrollDownBtn").onclick = ()=>{
+  timedAction("/touch",{
+    x:0,y:0,action:"scroll",
+    delta_y:600
+  });
+};
+
+$("rightClickBtn").onclick = async ()=>{
+  // Right click at the center of the remote viewport.
+  await timedAction("/touch",{
+    x:Number($("width").value)/2,
+    y:Number($("height").value)/2,
+    action:"right_click"
+  });
+};
+
+/* ---------------------------------------------------------
+   Keyboard — batched exact text
+--------------------------------------------------------- */
+
+const keyboardInput = $("keyboardInput");
+
+$("keyboardBtn").onclick = ()=>{
+  keyboardOpen = true;
+  keyboardInput.value = "";
+  keyboardInput.focus();
+  setStatus("Keyboard ready");
+};
+
+function queueText(text){
+  if(!text) return;
+
+  typeQueue += text;
+
+  clearTimeout(typeTimer);
+
+  typeTimer = setTimeout(async ()=>{
+    const textToSend = typeQueue;
+    typeQueue = "";
+
+    if(!textToSend) return;
+
+    try{
+      await timedAction("/type",{text:textToSend});
+    }catch{}
+  },35);
+}
+
+keyboardInput.addEventListener("beforeinput",e=>{
+  if(e.isComposing) return;
+
+  if(e.inputType === "insertText" && e.data){
+    e.preventDefault();
+    queueText(e.data);
+    return;
+  }
+
+  if(e.inputType === "insertLineBreak"){
+    e.preventDefault();
+    timedAction("/key",{key:"Enter"});
+    return;
+  }
+
+  if(e.inputType === "deleteContentBackward"){
+    e.preventDefault();
+    timedAction("/key",{key:"Backspace"});
+    return;
+  }
+
+  if(e.inputType === "deleteContentForward"){
+    e.preventDefault();
+    timedAction("/key",{key:"Delete"});
+  }
+});
+
+keyboardInput.addEventListener("input",e=>{
+  /*
+    Fallback for Android keyboards that don't expose useful beforeinput
+    events. We only send the newly inserted text and then reset the
+    local buffer.
+  */
+  if(e.isComposing) return;
+
+  const value = keyboardInput.value;
+
+  if(value){
+    keyboardInput.value = "";
+    queueText(value);
+  }
+});
+
+keyboardInput.addEventListener("compositionend",e=>{
+  if(e.data){
+    queueText(e.data);
+  }
+  keyboardInput.value = "";
+});
+
+keyboardInput.addEventListener("blur",()=>{
+  if(keyboardOpen){
+    // Keep state; user can reopen it.
+  }
+});
+
+/* ---------------------------------------------------------
+   Device clipboard bridge
+--------------------------------------------------------- */
+
+async function writeDeviceClipboard(text){
+  if(!navigator.clipboard){
+    throw new Error("Clipboard API unavailable. Use HTTPS.");
+  }
+  await navigator.clipboard.writeText(text || "");
+}
+
+async function readDeviceClipboard(){
+  if(!navigator.clipboard){
+    throw new Error("Clipboard API unavailable. Use HTTPS.");
+  }
+  return await navigator.clipboard.readText();
+}
+
+$("copyBtn").onclick = async ()=>{
+  try{
+    const r = await api("/selection");
+    const d = await r.json();
+
+    if(d.status !== "success") throw new Error(d.message || "copy failed");
+
+    await writeDeviceClipboard(d.text || "");
+    setStatus("Copied to device clipboard");
+  }catch(e){
+    setStatus("Copy failed: " + e.message);
+  }
+};
+
+$("cutBtn").onclick = async ()=>{
+  try{
+    const d = await timedAction("/cut");
+
+    if(d.status !== "success") throw new Error(d.message || "cut failed");
+
+    await writeDeviceClipboard(d.text || "");
+    setStatus("Cut to device clipboard");
+  }catch(e){
+    setStatus("Cut failed: " + e.message);
+  }
+};
+
+$("pasteBtn").onclick = async ()=>{
+  try{
+    const text = await readDeviceClipboard();
+
+    if(!text){
+      setStatus("Device clipboard is empty");
+      return;
+    }
+
+    await timedAction("/type",{text});
+    setStatus("Pasted from device clipboard");
+  }catch(e){
+    setStatus("Paste failed: " + e.message);
+  }
+};
+
+/* ---------------------------------------------------------
+   Fullscreen
+--------------------------------------------------------- */
+
+$("fullscreenBtn").onclick = async ()=>{
+  try{
+    if(!document.fullscreenElement){
+      await document.documentElement.requestFullscreen();
+    }else{
+      await document.exitFullscreen();
+    }
+  }catch{
+    setStatus("Fullscreen unavailable");
+  }
+};
+
+/* ---------------------------------------------------------
+   Debug
+--------------------------------------------------------- */
+
+$("debugBtn").onclick = ()=>{
+  debug = !debug;
+  $("debugBtn").textContent = "Debug: " + (debug ? "ON" : "OFF");
+};
+
+setInterval(()=>{
+  if(debug){
+    statusEl.textContent =
+      "tabs=" + tabs.length +
+      " active=" + activeIndex +
+      " size=" + $("width").value + "x" + $("height").value +
+      " format=" + $("format").value;
+  }
+},500);
+
+/* ---------------------------------------------------------
+   Live telemetry
+--------------------------------------------------------- */
+
+async function updateStats(){
+  const started = performance.now();
+
+  try{
+    const r = await api("/stats");
+    const d = await r.json();
+    const rtt = performance.now() - started;
+
+    $("fps").textContent = d.server_fps + " fps";
+    $("rtt").textContent = Math.round(rtt) + " ms";
+    $("ram").textContent =
+      d.ram_mb == null
+        ? "—"
+        : d.ram_mb + " / " + (d.ram_limit_mb || "?") + " MB";
+
+    $("cpu").textContent =
+      d.cpu_percent == null ? "—" : d.cpu_percent + "%";
+
+    $("frame").textContent =
+      d.frame_kb + " KB";
+
+    $("encode").textContent =
+      d.encode_ms + " ms";
+
+    $("chromeRam").textContent =
+      d.chromium_ram_mb + " MB";
+
+    $("actionRtt").textContent =
+      actionRTT == null ? "—" : Math.round(actionRTT) + " ms";
+  }catch{
+    $("rtt").textContent = "offline";
+  }
+}
+
+async function updateStorage(){
+  try{
+    const r = await api("/storage");
+    const d = await r.json();
+
+    $("storageText").textContent =
+      d.exists
+        ? `${d.size_mb} MB • ${d.files} files • ${d.path}`
+        : "not available";
+  }catch{
+    $("storageText").textContent = "unavailable";
+  }
+}
+
+/* ---------------------------------------------------------
+   Boot
+--------------------------------------------------------- */
+
+checkAuth();
+screenStream.src = "/screen?ts=" + Date.now();
+
+loadSettings();
+refreshTabs();
+updateStats();
+updateStorage();
+
+statsTimer = setInterval(updateStats,1000);
+setInterval(refreshTabs,2500);
+backupTimer = setInterval(updateBackupStatus,5000);
+updateBackupStatus();
+
+screenStream.addEventListener("load",()=>{
+  setStatus("Connected");
+});
+
+screenStream.addEventListener("error",()=>{
+  setStatus("Stream error — reconnecting…");
+
+  setTimeout(()=>{
+    checkAuth();
+screenStream.src = "/screen?ts=" + Date.now();
+  },1000);
+});
+
+(function(){
+ const b=$("fullHideButton"); let drag=false,sx=0,sy=0,sl=0,st=0;
+ const saved=JSON.parse(localStorage.getItem("remoteMiniPos")||"null");
+ if(saved){b.style.left=saved.x+"px";b.style.top=saved.y+"px";b.style.right="auto";b.style.bottom="auto";}
+ b.addEventListener("pointerdown",e=>{drag=false;sx=e.clientX;sy=e.clientY;const r=b.getBoundingClientRect();sl=r.left;st=r.top;b.setPointerCapture(e.pointerId);});
+ b.addEventListener("pointermove",e=>{if(!b.hasPointerCapture(e.pointerId))return;const dx=e.clientX-sx,dy=e.clientY-sy;if(Math.abs(dx)+Math.abs(dy)>4)drag=true;if(drag){b.style.left=Math.max(0,Math.min(innerWidth-b.offsetWidth,sl+dx))+"px";b.style.top=Math.max(0,Math.min(innerHeight-b.offsetHeight,st+dy))+"px";b.style.right="auto";b.style.bottom="auto";}});
+ b.addEventListener("pointerup",e=>{if(drag){const r=b.getBoundingClientRect();localStorage.setItem("remoteMiniPos",JSON.stringify({x:r.left,y:r.top}));e.preventDefault();}});
+})();
+</script>
+</body>
+</html>
